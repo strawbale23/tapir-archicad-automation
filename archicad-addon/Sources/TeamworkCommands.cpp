@@ -4,7 +4,7 @@
 #include <map>
 
 TeamworkSendCommand::TeamworkSendCommand () :
-    CommandBase (CommonSchema::NotUsed)
+    CommandBase (CommonSchema::Used)
 {
 }
 
@@ -30,7 +30,7 @@ GS::ObjectState TeamworkSendCommand::Execute (const GS::ObjectState& /*parameter
 }
 
 TeamworkReceiveCommand::TeamworkReceiveCommand () :
-    CommandBase (CommonSchema::NotUsed)
+    CommandBase (CommonSchema::Used)
 {
 }
 
@@ -56,7 +56,7 @@ GS::ObjectState TeamworkReceiveCommand::Execute (const GS::ObjectState& /*parame
 }
 
 ReserveElementsCommand::ReserveElementsCommand () :
-    CommandBase (CommonSchema::NotUsed)
+    CommandBase (CommonSchema::Used)
 {
 }
 
@@ -177,7 +177,7 @@ GS::ObjectState ReserveElementsCommand::Execute (const GS::ObjectState& paramete
 }
 
 ReleaseElementsCommand::ReleaseElementsCommand () :
-    CommandBase (CommonSchema::NotUsed)
+    CommandBase (CommonSchema::Used)
 {
 }
 

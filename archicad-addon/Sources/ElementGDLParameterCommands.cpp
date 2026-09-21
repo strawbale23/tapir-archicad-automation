@@ -1,5 +1,7 @@
+#include "GSUnID.hpp"
 #include "ElementGDLParameterCommands.hpp"
 #include "MigrationHelper.hpp"
+#include <cmath>
 
 constexpr const char* ParameterValueFieldName = "value";
 
@@ -145,7 +147,7 @@ static bool SetParamValueDouble (API_ChangeParamType& changeParam,
                                  const GS::ObjectState& parameterDetails)
 {
     double value;
-    if (parameterDetails.Get (ParameterValueFieldName, value)) {
+    if (parameterDetails.Get (ParameterValueFieldName, value) && std::isfinite (value)) {
         changeParam.realValue = value;
         return true;
     }
@@ -156,7 +158,7 @@ static bool SetParamValueOnOff (API_ChangeParamType& changeParam,
                                 const GS::ObjectState& parameterDetails)
 {
     GS::String value;
-    if (parameterDetails.Get (ParameterValueFieldName, value)) {
+    if (parameterDetails.Get (ParameterValueFieldName, value) && (value == "On" || value == "Off")) {
         changeParam.realValue = (value == "Off" ? 0 : 1);
         return true;
     }
@@ -400,91 +402,44 @@ GS::Optional<GS::UniString> GetGDLParametersOfElementsCommand::GetRawResponseSch
 })";
 }
 
-GS::ObjectState	GetGDLParametersOfElementsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+static GS::ObjectState ReadEvaluatedGDLParameters (API_ParamOwnerType paramOwner, Int32 libInd)
 {
-    GS::Array<GS::ObjectState> elements;
-    parameters.Get ("elements", elements);
-
-    GS::ObjectState response;
-    const auto& elemGdlParameterListAdder = response.AddList<GS::ObjectState> ("gdlParametersOfElements");
-
-    for (const GS::ObjectState& element : elements) {
-        const GS::ObjectState* elementId = element.Get ("elementId");
-        if (elementId == nullptr) {
-            elemGdlParameterListAdder (CreateErrorResponse (APIERR_BADPARS, "elementId is missing"));
-            continue;
-        }
-
-        API_ParamOwnerType paramOwner = {};
-        paramOwner.libInd = -1;
-        paramOwner.guid = GetGuidFromObjectState (*elementId);
-
-        API_Element apiElement = {};
-        apiElement.header.guid = paramOwner.guid;
-        GSErrCode err = ACAPI_Element_Get (&apiElement);
-        if (err != NoError) {
-            const GS::UniString errorMsg = GS::UniString::Printf ("Not found element with guid %T!", APIGuidToString (paramOwner.guid).ToPrintf ());
-            elemGdlParameterListAdder (CreateErrorResponse (err, errorMsg));
-            continue;
-        }
-
-#ifdef ServerMainVers_2600
-        paramOwner.type = apiElement.header.type;
-#else
-        paramOwner.typeID = apiElement.header.typeID;
-#endif
-
         API_GetParamsType getParams = {};
-        err = ACAPI_LibraryPart_OpenParameters (&paramOwner);
+        GSErrCode err = ACAPI_LibraryPart_OpenParameters (&paramOwner);
+        const bool parametersOpen = err == NoError;
+        const GS::OnExit closeParameters ([&] () {
+            if (parametersOpen) ACAPI_LibraryPart_CloseParameters ();
+            ACAPI_DisposeAddParHdl (&getParams.params);
+        });
         if (err == NoError) {
             err = ACAPI_LibraryPart_GetActParameters (&getParams);
         }
 
         if (err != NoError) {
             const GS::UniString errorMsg = GS::UniString::Printf ("Failed to get parameters of element with guid %T!", APIGuidToString (paramOwner.guid).ToPrintf ());
-            elemGdlParameterListAdder (CreateErrorResponse (err, errorMsg));
-            continue;
+            return CreateErrorResponse (err, errorMsg);
         }
 
-        Int32 libInd = -1;
-        if (GetElemTypeId (apiElement.header) == API_ObjectID) {
-            libInd = apiElement.object.libInd;
-        } else if (GetElemTypeId (apiElement.header) == API_LampID) {
-            libInd = apiElement.lamp.libInd;
-        } else if (GetElemTypeId (apiElement.header) == API_WindowID) {
-            libInd = apiElement.window.openingBase.libInd;
-        } else if (GetElemTypeId (apiElement.header) == API_DoorID) {
-            libInd = apiElement.door.openingBase.libInd;
-        } else if (GetElemTypeId (apiElement.header) == API_SkylightID) {
-            libInd = apiElement.skylight.openingBase.libInd;
-        } else if (GetElemTypeId (apiElement.header) == API_ZoneID) {
-            libInd = apiElement.zone.libInd;
-        } else if (GetElemTypeId (apiElement.header) == API_LabelID) {
-            libInd = apiElement.label.u.symbol.libInd;
-        } else if (GetElemTypeId (apiElement.header) == API_DrawingID) {
-            libInd = apiElement.drawing.title.libInd;
-        } else if (GetElemTypeId (apiElement.header) == API_CurtainWallFrameID) {
-            libInd = apiElement.cwFrame.libInd;
-        } else if (GetElemTypeId (apiElement.header) == API_CurtainWallPanelID) {
-            libInd = apiElement.cwPanel.libInd;
-        } else if (GetElemTypeId (apiElement.header) == API_CurtainWallJunctionID) {
-            libInd = apiElement.cwJunction.libInd;
-        } else if (GetElemTypeId (apiElement.header) == API_CurtainWallAccessoryID) {
-            libInd = apiElement.cwAccessory.libInd;
-        }
-
-        double a;
-        double b;
-        Int32 addParNum;
-        API_AddParType** addPars;
-        ACAPI_LibraryPart_GetParams (libInd, &a, &b, &addParNum, &addPars);
+        double a = 0, b = 0;
+        Int32 addParNum = 0;
+        API_AddParType** addPars = nullptr;
+        const GS::OnExit freeLibraryParameters ([&] () { ACAPI_DisposeAddParHdl (&addPars); });
+        const GSErrCode libraryParamsError = ACAPI_LibraryPart_GetParams (libInd, &a, &b, &addParNum, &addPars);
+        const GSSize libraryCount = libraryParamsError == NoError && addPars != nullptr
+            ? BMGetHandleSize (reinterpret_cast<GSHandle> (addPars)) / sizeof (API_AddParType) : 0;
 
         const GSSize nParams = BMGetHandleSize ((GSHandle) getParams.params) / sizeof (API_AddParType);
         GS::ObjectState gdlParameters;
         const auto& parameterListAdder = gdlParameters.AddList<GS::ObjectState> ("parameters");
         for (GSIndex ii = 0; ii < nParams; ++ii) {
             const API_AddParType& actParam = (*getParams.params)[ii];
-            const API_AddParType& actLibPartParam = (*addPars)[ii];
+            const API_AddParType* descriptionSource = &actParam;
+            // Library and placed parameter arrays need not have equal lengths or order.
+            for (GSIndex libraryIndex = 0; libraryIndex < libraryCount; ++libraryIndex) {
+                if (GS::String ((*addPars)[libraryIndex].name) == GS::String (actParam.name)) {
+                    descriptionSource = &(*addPars)[libraryIndex]; break;
+                }
+            }
 
             if (actParam.typeID == APIParT_Separator) {
                 continue;
@@ -492,11 +447,16 @@ GS::ObjectState	GetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
 
             API_GetParamValuesType getValues = {};
             getValues.index = actParam.index;
-            ACAPI_LibraryPart_GetParamValues (&getValues);
+            const GS::OnExit freeValues ([&] () {
+                if (getValues.uStrValues != nullptr) BMhFree (reinterpret_cast<GSHandle> (getValues.uStrValues));
+                if (getValues.realValues != nullptr) BMhFree (reinterpret_cast<GSHandle> (getValues.realValues));
+            });
+            err = ACAPI_LibraryPart_GetParamValues (&getValues);
+            if (err != NoError) break;
 
             GS::ObjectState gdlParameterDetails;
             gdlParameterDetails.Add ("name", actParam.name);
-            gdlParameterDetails.Add ("displayName", GS::UniString (actLibPartParam.uDescname));
+            gdlParameterDetails.Add ("displayName", GS::UniString (descriptionSource->uDescname));
             gdlParameterDetails.Add ("index", actParam.index);
             gdlParameterDetails.Add ("type", ConvertAddParIDToString (actParam.typeID));
             if (actParam.typeMod == API_ParArray) {
@@ -584,7 +544,7 @@ GS::ObjectState	GetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
                             possibleValues (tmpUStr);
                             strPos += GS::ucslen (strPos) + 1;
                         }
-                        BMhFree ((GSHandle)getValues.uStrValues);
+
                     } else if (getValues.realValues != nullptr) {
                         const auto& possibleValues = gdlParameterDetails.AddList<GS::ObjectState> ("possibleValues");
                         for (GSIndex valIdx = 0; valIdx < getValues.nVals; ++valIdx) {
@@ -616,7 +576,7 @@ GS::ObjectState	GetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
                             }
                             possibleValues (os);
                         }
-                        BMhFree ((GSHandle)getValues.realValues);
+
                     }
                     gdlParameterDetails.Add ("canHaveCustomValue", getValues.custom);
                 }
@@ -624,10 +584,73 @@ GS::ObjectState	GetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
 
             parameterListAdder (gdlParameterDetails);
         }
-        elemGdlParameterListAdder (gdlParameters);
-        ACAPI_DisposeAddParHdl (&getParams.params);
-    }
+        if (err != NoError) return CreateErrorResponse (err, "Cannot read evaluated parameter constraints.");
+        return gdlParameters;
+}
 
+GS::ObjectState	GetGDLParametersOfElementsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+{
+    GS::Array<GS::ObjectState> elements;
+    parameters.Get ("elements", elements);
+
+    GS::ObjectState response;
+    const auto& elemGdlParameterListAdder = response.AddList<GS::ObjectState> ("gdlParametersOfElements");
+
+    for (const GS::ObjectState& element : elements) {
+        const GS::ObjectState* elementId = element.Get ("elementId");
+        if (elementId == nullptr) {
+            elemGdlParameterListAdder (CreateErrorResponse (APIERR_BADPARS, "elementId is missing"));
+            continue;
+        }
+
+        API_ParamOwnerType paramOwner = {};
+        paramOwner.libInd = -1;
+        paramOwner.guid = GetGuidFromObjectState (*elementId);
+
+        API_Element apiElement = {};
+        apiElement.header.guid = paramOwner.guid;
+        GSErrCode err = ACAPI_Element_Get (&apiElement);
+        if (err != NoError) {
+            const GS::UniString errorMsg = GS::UniString::Printf ("Not found element with guid %T!", APIGuidToString (paramOwner.guid).ToPrintf ());
+            elemGdlParameterListAdder (CreateErrorResponse (err, errorMsg));
+            continue;
+        }
+
+#ifdef ServerMainVers_2600
+        paramOwner.type = apiElement.header.type;
+#else
+        paramOwner.typeID = apiElement.header.typeID;
+#endif
+
+        Int32 libInd = -1;
+        if (GetElemTypeId (apiElement.header) == API_ObjectID) {
+            libInd = apiElement.object.libInd;
+        } else if (GetElemTypeId (apiElement.header) == API_LampID) {
+            libInd = apiElement.lamp.libInd;
+        } else if (GetElemTypeId (apiElement.header) == API_WindowID) {
+            libInd = apiElement.window.openingBase.libInd;
+        } else if (GetElemTypeId (apiElement.header) == API_DoorID) {
+            libInd = apiElement.door.openingBase.libInd;
+        } else if (GetElemTypeId (apiElement.header) == API_SkylightID) {
+            libInd = apiElement.skylight.openingBase.libInd;
+        } else if (GetElemTypeId (apiElement.header) == API_ZoneID) {
+            libInd = apiElement.zone.libInd;
+        } else if (GetElemTypeId (apiElement.header) == API_LabelID) {
+            libInd = apiElement.label.u.symbol.libInd;
+        } else if (GetElemTypeId (apiElement.header) == API_DrawingID) {
+            libInd = apiElement.drawing.title.libInd;
+        } else if (GetElemTypeId (apiElement.header) == API_CurtainWallFrameID) {
+            libInd = apiElement.cwFrame.libInd;
+        } else if (GetElemTypeId (apiElement.header) == API_CurtainWallPanelID) {
+            libInd = apiElement.cwPanel.libInd;
+        } else if (GetElemTypeId (apiElement.header) == API_CurtainWallJunctionID) {
+            libInd = apiElement.cwJunction.libInd;
+        } else if (GetElemTypeId (apiElement.header) == API_CurtainWallAccessoryID) {
+            libInd = apiElement.cwAccessory.libInd;
+        }
+
+        elemGdlParameterListAdder (ReadEvaluatedGDLParameters (paramOwner, libInd));
+    }
     return response;
 }
 
@@ -698,7 +721,7 @@ GS::ObjectState	SetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
     GS::ObjectState response;
     const auto& executionResults = response.AddList<GS::ObjectState> ("executionResults");
 
-    ACAPI_CallUndoableCommand ("Set GDL Parameters of Elements", [&]() -> GSErrCode {
+    const GSErrCode transaction = ACAPI_CallUndoableCommand ("Set GDL Parameters of Elements", [&]() -> GSErrCode {
         for (const GS::ObjectState& elementWithGDLParameters : elementsWithGDLParameters) {
             GSErrCode err = NoError;
             GS::UniString errMessage;
@@ -766,7 +789,8 @@ GS::ObjectState	SetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
                                 }
 
                                 ACAPI_DisposeAddParHdl (&getParams.params);
-                                ACAPI_LibraryPart_GetActParameters (&getParams);
+                                err = ACAPI_LibraryPart_GetActParameters (&getParams);
+                                if (err != NoError) break;
                             }
                             if (err != NoError) {
                                 break;
@@ -778,7 +802,8 @@ GS::ObjectState	SetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
                             }
 
                             ACAPI_DisposeAddParHdl (&getParams.params);
-                            ACAPI_LibraryPart_GetActParameters (&getParams);
+                            err = ACAPI_LibraryPart_GetActParameters (&getParams);
+                            if (err != NoError) break;
                         }
                     }
 
@@ -818,7 +843,44 @@ GS::ObjectState	SetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
                         }
 
                         memo.params = getParams.params;
-                        err = ACAPI_Element_Change (&element, &mask, &memo, APIMemoMask_AddPars, true);
+                        const auto elementType = GetElemTypeId (element.header);
+                        if (elementType == API_DoorID || elementType == API_WindowID)
+                            err = ACAPI_Element_ChangeExt (&element, &mask, &memo, APIMemoMask_AddPars, 0, nullptr, true, 0);
+                        else err = ACAPI_Element_Change (&element, &mask, &memo, APIMemoMask_AddPars, true);
+
+                        // The Change/ChangeExt call above only reports whether Archicad accepted the
+                        // request, not whether the element's own size actually followed the GDL
+                        // parameters that drive it (a documented risk elsewhere in this codebase -
+                        // e.g. ACAPI_Element_Change silently discarding a Drawing's drawingGuid field,
+                        // see ElementCommands.cpp). Re-read the element and confirm xRatio/yRatio or
+                        // width/height actually match what was requested before reporting success.
+                        const bool sizeIsVerifiable = elementType == API_ObjectID || elementType == API_LampID ||
+                                                       elementType == API_WindowID || elementType == API_DoorID ||
+                                                       elementType == API_SkylightID;
+                        if (err == NoError && sizeIsVerifiable) {
+                            API_Element recheck = {};
+                            recheck.header.guid = elemGuid;
+                            const GSErrCode recheckErr = ACAPI_Element_Get (&recheck);
+                            if (recheckErr != NoError) {
+                                err = recheckErr;
+                                errMessage = "GDL parameters were set, but the element could not be re-read to confirm its resulting size.";
+                            } else {
+                                double actualA = 0, actualB = 0, expectedA = getParams.a, expectedB = getParams.b;
+                                switch (elementType) {
+                                    case API_ObjectID: case API_LampID:
+                                        actualA = recheck.object.xRatio; actualB = recheck.object.yRatio; break;
+                                    case API_WindowID: case API_DoorID:
+                                        actualA = recheck.window.openingBase.width; actualB = recheck.window.openingBase.height; break;
+                                    case API_SkylightID:
+                                        actualA = recheck.skylight.openingBase.width; actualB = recheck.skylight.openingBase.height; break;
+                                    default: break;
+                                }
+                                if (std::abs (actualA - expectedA) > 1e-6 || std::abs (actualB - expectedB) > 1e-6) {
+                                    err = APIERR_GENERAL;
+                                    errMessage = "GDL parameters were set, but the element's resulting size does not match the requested values; inspect before retrying.";
+                                }
+                            }
+                        }
                     }
                 }
                 ACAPI_LibraryPart_CloseParameters ();
@@ -839,6 +901,7 @@ GS::ObjectState	SetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
         return NoError;
     });
 
+    if (transaction != NoError) return CreateErrorResponse (transaction, "GDL parameter transaction failed; committed state is not confirmed.");
     return response;
 }
 
@@ -894,7 +957,7 @@ SetGDLParametersOfElementsCommand::SetOneGDLParameter (
         }
         ArrayParameterChange change;
         change.name = changeParam.name;
-        change.typeID = gdlParametersTypeDictionary[changeParam.name];
+        change.typeID = actParam->typeID;
         if (!ParseArrayParameterValue (parameter, change.typeID, change)) {
             errMessage = GS::UniString::Printf ("Invalid input: the given value is not a valid array for parameter %s of element %T (use [v1, v2, ...] for one-dimensional and [[v11, v12], [v21, v22]] for two-dimensional arrays)", changeParam.name, APIGuidToString (elemGuid).ToPrintf ());
             return APIERR_BADPARS;
@@ -930,7 +993,7 @@ SetGDLParametersOfElementsCommand::SetOneGDLParameter (
         return APIERR_BADPARS;
     }
 
-    switch (gdlParametersTypeDictionary[changeParam.name]) {
+    switch (actParam->typeID) {
         case APIParT_Integer:
         case APIParT_PenCol:
         case APIParT_LineTyp:
@@ -974,8 +1037,8 @@ SetGDLParametersOfElementsCommand::SetOneGDLParameter (
             break;
         default:
         case APIParT_Dictionary:
-            // Not supported by the Archicad API yet
-            break;
+            errMessage = "This parameter type is not supported for mutation.";
+            return APIERR_BADPARS;
     }
 
     GSErrCode err = ACAPI_LibraryPart_ChangeAParameter (&changeParam);
@@ -1103,4 +1166,32 @@ GSErrCode SetGDLParametersOfElementsCommand::ApplyArrayParameterChanges (
     }
 
     return NoError;
+}
+
+GS::Optional<GS::UniString> GetLibraryPartParametersCommand::GetInputParametersSchema () const
+{
+    return R"({"type":"object","properties":{"libraryPart":{"type":"object","properties":{"index":{"type":"integer","minimum":1},"guid":{"type":"string","format":"uuid"}},"required":["index","guid"],"additionalProperties":false}},"required":["libraryPart"],"additionalProperties":false})";
+}
+GS::Optional<GS::UniString> GetLibraryPartParametersCommand::GetRawResponseSchema () const
+{
+    return R"({"type":"object","properties":{"index":{"type":"integer"},"ownUnID":{"type":"string"},"parentUnID":{"type":"string"},"parameters":{"$ref":"#/GDLParameterArray"},"context":{"const":"unplacedLibraryPart"}},"required":["index","ownUnID","parentUnID","parameters","context"],"additionalProperties":false})";
+}
+GS::ObjectState GetLibraryPartParametersCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const
+{
+    const auto* selection = parameters.Get ("libraryPart");
+    if (selection == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Library part index and inventory GUID are required.");
+    API_LibPart part = {}; selection->Get ("index", part.index);
+    const API_Guid expected = GetGuidFromObjectState (*selection);
+    if (part.index <= 0 || expected == APINULLGuid) return CreateErrorResponse (APIERR_BADPARS, "Invalid library selection.");
+    const GS::OnExit dispose ([&] () { delete part.location; });
+    GSErrCode err = ACAPI_LibraryPart_Get (&part);
+    if (err != NoError) return CreateErrorResponse (err, "Library part is not loaded.");
+    if (GSGuid2APIGuid (GS::UnID (part.ownUnID).GetMainGuid ()) != expected || part.missingDef)
+        return CreateErrorResponse (APIERR_BADPARS, "Library inventory changed or definition is missing; refresh selection.");
+    API_ParamOwnerType owner = {}; owner.libInd = part.index;
+    GS::ObjectState result = ReadEvaluatedGDLParameters (owner, part.index);
+    if (result.Contains ("error")) return result;
+    result.Add ("index", part.index); result.Add ("ownUnID", GS::UniString (part.ownUnID));
+    result.Add ("parentUnID", GS::UniString (part.parentUnID)); result.Add ("context", "unplacedLibraryPart");
+    return result;
 }

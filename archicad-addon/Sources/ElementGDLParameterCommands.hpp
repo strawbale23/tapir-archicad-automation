@@ -51,3 +51,12 @@ private:
         const API_Guid& elemGuid,
         GS::UniString& errMessage);
 };
+
+class GetLibraryPartParametersCommand : public CommandBase {
+public:
+    GetLibraryPartParametersCommand () : CommandBase (CommonSchema::Used) {}
+    GS::String GetName () const override { return "GetLibraryPartParameters"; }
+    GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    GS::Optional<GS::UniString> GetRawResponseSchema () const override;
+    GS::ObjectState Execute (const GS::ObjectState&, GS::ProcessControl&) const override;
+};

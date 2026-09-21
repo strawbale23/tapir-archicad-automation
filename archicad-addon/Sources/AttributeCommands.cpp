@@ -3,6 +3,7 @@
 #include "ProfileVectorImage.hpp"
 #include "ProfileAdditionalInfo.hpp"
 #include "VectorImageIterator.hpp"
+#include <cmath>
 #ifdef ServerMainVers_2700
 #include "ADBAttributeIndex.hpp"
 #endif
@@ -16,6 +17,20 @@ static bool IsPositiveAttributeIndex (const API_AttributeIndex& index)
 #else
     return index > 0;
 #endif
+}
+
+// Only a genuinely absent name permits creation. A failed explicit selector
+// must never fall through to creating a replacement resource with default data.
+static GSErrCode FindAttributeForWrite (const GS::ObjectState& data,bool overwrite,API_Attribute& attribute,bool& exists)
+{
+    const bool byIndex=overwrite && data.Contains ("index");
+    const bool byId=overwrite && data.Contains ("attributeId");
+    Int32 index=0;
+    if ((byIndex && byId) || (byIndex && (!data.Get ("index",index) || index<1)) ||
+        (byId && GetGuidFromAttributesArrayItem (data)==APINULLGuid)) return APIERR_BADPARS;
+    const GSErrCode err=ACAPI_Attribute_Get (&attribute);
+    exists=err==NoError;
+    return err==NoError || (err==APIERR_BADNAME && !byIndex && !byId)?NoError:err;
 }
 
 // Shared "fields" filter for detailed Get commands, matching the {ids, properties} pattern already used by
@@ -61,12 +76,14 @@ static GS::Optional<GS::ObjectState> GetAttributeIdFromIndex (API_AttrTypeID att
     return CreateAttributeIdObjectState (attribute.header.guid);
 }
 
-static bool GetAttributeIndexFromAttributeId (const GS::ObjectState& attributeId, API_AttrTypeID attributeType, API_AttributeIndex& attributeIndex)
+static bool GetAttributeIndexFromAttributeId (const GS::ObjectState& attributeId, API_AttrTypeID attributeType, API_AttributeIndex& attributeIndex, GSErrCode* lookupError = nullptr)
 {
     API_Attribute attribute = {};
     attribute.header.guid = GetGuidFromAttributesArrayItem (attributeId);
     attribute.header.typeID = attributeType;
-    if (ACAPI_Attribute_Get (&attribute) != NoError) {
+    const GSErrCode err = attribute.header.guid == APINULLGuid ? APIERR_BADPARS : ACAPI_Attribute_Get (&attribute);
+    if (lookupError != nullptr) *lookupError = err;
+    if (err != NoError) {
         return false;
     }
 
@@ -151,16 +168,17 @@ GS::ObjectState GetAttributesByTypeCommand::Execute (const GS::ObjectState& para
     const auto& attributes = response.AddList<GS::ObjectState> ("attributes");
 
     GS::Array<API_Attribute> attrs;
-    ACAPI_Attribute_GetAttributesByType (typeID, attrs);
+    const GSErrCode err = ACAPI_Attribute_GetAttributesByType (typeID, attrs);
+    if (err != NoError) {
+        for (API_Attribute& attr : attrs) DisposeAttribute (attr);
+        return CreateErrorResponse (err, "Cannot enumerate the requested project attributes.");
+    }
 
     for (API_Attribute& attr : attrs) {
         GS::ObjectState attributeDetails;
         attributeDetails.Add ("attributeId", CreateGuidObjectState (attr.header.guid));
         attributeDetails.Add ("index", GetAttributeIndex (attr.header.index));
         attributeDetails.Add ("name", GS::UniString (attr.header.name));
-        // API_Attr_Head::modiTime is a GSTime (seconds since 1970-01-01 00:00:00 UTC) in a UInt64,
-        // the same stamp the Attribute Manager writes as ModiTime into its XML export.
-        attributeDetails.Add ("modificationTime", static_cast<Int64> (attr.header.modiTime));
         attributes (attributeDetails);
 
         DisposeAttribute (attr);
@@ -1328,11 +1346,38 @@ static ProfileItem* GetHatchProfileItemNonConst (HatchObject& hatch) { return ha
 // image, matched by the skinId GetProfiles reports. Mutation goes through Archicad's own HatchObject/
 // ProfileItem setters - the same objects GetProfiles reads via their const getters - so this genuinely
 // writes back into the profile, not just into our own copy of the data.
-static void ApplyProfileSkinOverrides (ProfileVectorImage& pvi, const GS::ObjectState& override)
+static bool ValidateProfileSkinReferences (const GS::ObjectState& skin)
 {
+    if (skin.Contains ("buildingMaterialId") && skin.Contains ("surfaceId")) return false;
+    const std::pair<const char*,API_AttrTypeID> references[]={{"buildingMaterialId",API_BuildingMaterialID},{"surfaceId",API_MaterialID},
+        {"fillId",API_FilltypeID},{"contourLineTypeId",API_LinetypeID},{"cutEndLineTypeId",API_LinetypeID},{"lineTypeId",API_LinetypeID}};
+    for (const auto& field:references) {
+        GS::ObjectState id; API_AttributeIndex index;
+        if (skin.Get (field.first,id) && !GetAttributeIndexFromAttributeId (id,field.second,index)) return false;
+    }
+    for (const char* field:{"pen","contourPen","cutEndLinePen"}) {
+        Int32 value=0;
+        if (skin.Contains (field) && (!skin.Get (field,value) || value<1 || value>255)) return false;
+    }
+    GS::Array<GS::ObjectState> edges;
+    if (skin.Get ("edgeOverrides",edges)) {
+        if (edges.GetSize ()>10000) return false;
+        GS::HashSet<Int32> seen;
+        for (const auto& edge:edges) {
+            Int32 index=-1;
+            if (!edge.Get ("edgeIndex",index) || index<1 || seen.Contains (index) || !ValidateProfileSkinReferences (edge)) return false;
+            seen.Add (index);
+        }
+    }
+    return true;
+}
+
+static bool ApplyProfileSkinOverrides (ProfileVectorImage& pvi, const GS::ObjectState& override)
+{
+    if (!ValidateProfileSkinReferences (override)) return false;
     GS::UniString skinIdStr;
     if (!override.Get ("skinId", skinIdStr)) {
-        return;
+        return false;
     }
     GS::Guid skinId (skinIdStr);
 
@@ -1390,6 +1435,7 @@ static void ApplyProfileSkinOverrides (ProfileVectorImage& pvi, const GS::Object
         }
 
         ProfileItem* profileItem = GetHatchProfileItemNonConst (hatch);
+        if (profileItem==nullptr && (override.Contains ("isCore") || override.Contains ("isFinish") || override.Contains ("visibleCutEndLines") || override.Contains ("cutEndLinePen") || override.Contains ("cutEndLineTypeId"))) return false;
         if (profileItem != nullptr) {
             bool isCore;
             if (override.Get ("isCore", isCore)) {
@@ -1420,12 +1466,12 @@ static void ApplyProfileSkinOverrides (ProfileVectorImage& pvi, const GS::Object
         if (override.Get ("edgeOverrides", edgeOverrides)) {
             for (const GS::ObjectState& edgeOverride : edgeOverrides) {
                 Int32 edgeIndex = -1;
-                if (!edgeOverride.Get ("edgeIndex", edgeIndex) || edgeIndex < 0) {
-                    continue;
+                if (!edgeOverride.Get ("edgeIndex", edgeIndex) || edgeIndex<=0 || edgeIndex>=static_cast<Int32> (hatch.GetCoords ().GetSize ())-1) {
+                    return false;
                 }
                 ProfileEdgeData* edgeData = hatch.GetProfileEdgeData ((UIndex) edgeIndex);
                 if (edgeData == nullptr) {
-                    continue;
+                    return false;
                 }
                 Int32 pen;
                 if (edgeOverride.Get ("pen", pen)) {
@@ -1453,8 +1499,9 @@ static void ApplyProfileSkinOverrides (ProfileVectorImage& pvi, const GS::Object
             }
         }
 
-        return;
+        return true;
     }
+    return false;
 }
 
 // Converts caller-supplied polygon contours (same 0-based polygonCoordinates/polygonArcs convention
@@ -1470,8 +1517,9 @@ static void ApplyProfileSkinOverrides (ProfileVectorImage& pvi, const GS::Object
 // arcs' begIndex/endIndex are taken as 0-based within their own contour's polygonCoordinates (matching
 // the public API's PolyArc convention) and rebased onto the absolute coords array here.
 #ifdef ServerMainVers_2700
-static void BuildHatchPolygonGeometry (const GS::Array<GS::ObjectState>& contours, GS::Array<Coord>& outCoords, GS::Array<PolyArcRec>& outArcs, GS::Array<UInt32>& outSubPolyEnds)
+static bool BuildHatchPolygonGeometry (const GS::Array<GS::ObjectState>& contours, GS::Array<Coord>& outCoords, GS::Array<PolyArcRec>& outArcs, GS::Array<UInt32>& outSubPolyEnds)
 {
+    if (contours.IsEmpty () || contours.GetSize ()>1000) return false;
     auto makeCoord = [] (double x, double y) { Coord c = {}; c.x = x; c.y = y; return c; };
 
     outCoords.Push (makeCoord (0.0, 0.0));  // [0] reserved anchor
@@ -1480,13 +1528,15 @@ static void BuildHatchPolygonGeometry (const GS::Array<GS::ObjectState>& contour
     for (const GS::ObjectState& contour : contours) {
         GS::Array<GS::ObjectState> polygonCoordinates;
         contour.Get ("polygonCoordinates", polygonCoordinates);
-        if (polygonCoordinates.GetSize () < 3) {
-            continue;
+        if (polygonCoordinates.GetSize ()>1 && IsSame2DCoordinate (Get2DCoordinateFromObjectState (polygonCoordinates.GetFirst ()),Get2DCoordinateFromObjectState (polygonCoordinates.GetLast ()))) polygonCoordinates.Pop ();
+        if (polygonCoordinates.GetSize () < 3 || outCoords.GetSize ()+polygonCoordinates.GetSize ()+1>10000) {
+            return false;
         }
 
         UIndex iStart = (UIndex) outCoords.GetSize ();
         for (const GS::ObjectState& coordOs : polygonCoordinates) {
             API_Coord c = Get2DCoordinateFromObjectState (coordOs);
+            if (!std::isfinite (c.x) || !std::isfinite (c.y)) return false;
             outCoords.Push (makeCoord (c.x, c.y));
         }
         outCoords.Push (outCoords[iStart]);  // close the contour by repeating its first vertex
@@ -1497,12 +1547,14 @@ static void BuildHatchPolygonGeometry (const GS::Array<GS::ObjectState>& contour
             for (const GS::ObjectState& arcOs : polygonArcs) {
                 Int32 begIndex = 0, endIndex = 0;
                 double arcAngle = 0.0;
-                if (arcOs.Get ("begIndex", begIndex) && arcOs.Get ("endIndex", endIndex) && arcOs.Get ("arcAngle", arcAngle)) {
-                    outArcs.Push (PolyArcRec (iStart + (UIndex) begIndex, iStart + (UIndex) endIndex, arcAngle));
-                }
+                if (!arcOs.Get ("begIndex", begIndex) || !arcOs.Get ("endIndex", endIndex) || !arcOs.Get ("arcAngle", arcAngle) ||
+                    begIndex<0 || endIndex<0 || begIndex>=static_cast<Int32> (polygonCoordinates.GetSize ()) || endIndex>static_cast<Int32> (polygonCoordinates.GetSize ()) ||
+                    begIndex==endIndex || !std::isfinite (arcAngle) || outArcs.GetSize ()>=10000) return false;
+                outArcs.Push (PolyArcRec (iStart + (UIndex) begIndex, iStart + (UIndex) endIndex, arcAngle));
             }
         }
     }
+    return true;
 }
 
 // Builds a brand-new HatchObject (profile skin) from a caller-supplied skin definition (CreateProfiles'
@@ -1534,6 +1586,7 @@ static void BuildHatchPolygonGeometry (const GS::Array<GS::ObjectState>& contour
 // ever lost by skipping them.
 static bool BuildHatchFromSkinDefinition (const GS::ObjectState& skinDef, HatchObject& outHatch)
 {
+    if (!ValidateProfileSkinReferences (skinDef)) return false;
     GS::Array<GS::ObjectState> contours;
     if (!skinDef.Get ("contours", contours) || contours.IsEmpty ()) {
         return false;
@@ -1542,7 +1595,7 @@ static bool BuildHatchFromSkinDefinition (const GS::ObjectState& skinDef, HatchO
     GS::Array<Coord> coords;
     GS::Array<PolyArcRec> arcs;
     GS::Array<UInt32> subPolyEnds;
-    BuildHatchPolygonGeometry (contours, coords, arcs, subPolyEnds);
+    if (!BuildHatchPolygonGeometry (contours, coords, arcs, subPolyEnds)) return false;
     if (coords.GetSize () < 5) {  // reserved anchor + at least 3 real vertices + 1 closing duplicate
         return false;
     }
@@ -1635,18 +1688,18 @@ static bool BuildHatchFromSkinDefinition (const GS::ObjectState& skinDef, HatchO
     if (skinDef.Get ("edgeOverrides", edgeOverrides)) {
         for (const GS::ObjectState& edgeOverride : edgeOverrides) {
             Int32 edgeIndex = -1;
-            if (!edgeOverride.Get ("edgeIndex", edgeIndex) || edgeIndex < 0) {
-                continue;
+            if (!edgeOverride.Get ("edgeIndex", edgeIndex) || edgeIndex<=0 || static_cast<USize> (edgeIndex)>=edgeCount-1) {
+                return false;
             }
             // Index 0 and edgeCount-1 are the anchor-bridge slots (see crash investigation note
             // above) - never part of the rendered geometry, and writing to them has demonstrated a
-            // non-deterministic Archicad-side crash. Skip them rather than risk it.
+            // non-deterministic Archicad-side crash. Reject these inputs.
             if ((UIndex) edgeIndex == 0 || (UIndex) edgeIndex == edgeCount - 1) {
-                continue;
+                return false;
             }
             ProfileEdgeData* edgeData = outHatch.GetProfileEdgeData ((UIndex) edgeIndex);
             if (edgeData == nullptr) {
-                continue;
+                return false;
             }
             Int32 pen;
             if (edgeOverride.Get ("pen", pen)) {
@@ -2674,8 +2727,19 @@ GS::ObjectState CreateAttributesCommandBase::Execute (const GS::ObjectState& par
     GS::Array<GS::ObjectState> dataArray;
     parameters.Get (arrayFieldName, dataArray);
 
+    if (dataArray.IsEmpty () || dataArray.GetSize () > 1000)
+        return CreateErrorResponse (APIERR_BADPARS,"Supply 1..1000 attributes per request.");
+
     bool overwriteExisting = false;
     parameters.Get ("overwriteExisting", overwriteExisting);
+    GS::UniString policy=overwriteExisting ? "Overwrite" : "Error";
+    if (parameters.Contains ("ifExists")) {
+        if (parameters.Contains ("overwriteExisting") || (attrTypeID!=API_LayerID && attrTypeID!=API_BuildingMaterialID && attrTypeID!=API_LayerCombID && attrTypeID!=API_MaterialID && attrTypeID!=API_LinetypeID) ||
+            !parameters.Get ("ifExists",policy) || (policy!="Error" && policy!="Overwrite" && policy!="ReuseIfMatching"))
+            return CreateErrorResponse (APIERR_BADPARS,"Supply one supported collision policy: Error, Overwrite or ReuseIfMatching.");
+        overwriteExisting=policy=="Overwrite";
+    }
+    const bool reuseMatching=policy=="ReuseIfMatching";
 
     GS::ObjectState response;
     const auto& attributeIds = response.AddList<GS::ObjectState> ("attributeIds");
@@ -2683,28 +2747,54 @@ GS::ObjectState CreateAttributesCommandBase::Execute (const GS::ObjectState& par
     for (const GS::ObjectState& data : dataArray) {
         API_Attribute attr = {};
         attr.header.typeID = attrTypeID;
+        GS::UniString materialId,manufacturer,description;
+        if (attrTypeID==API_BuildingMaterialID) {
+            attr.buildingMaterial.id=&materialId;
+            attr.buildingMaterial.manufacturer=&manufacturer;
+            attr.buildingMaterial.description=&description;
+        }
         API_AttributeDef attrDef = {};
+        const GS::OnExit dispose ([&] { ACAPI_DisposeAttrDefsHdls (&attrDef); });
 
         GS::UniString name;
         if (data.Get ("name", name)) {
             attr.header.uniStringNamePtr = &name;
         }
 
-        if (overwriteExisting) {
+        if (overwriteExisting || reuseMatching) {
+            if (data.Contains ("attributeId") && data.Contains ("index")) {
+                attributeIds (CreateErrorResponse (APIERR_BADPARS,"Specify attributeId or index, not both.")); continue;
+            }
             attr.header.guid = GetGuidFromAttributesArrayItem (data);
+            if (data.Contains ("attributeId") && attr.header.guid == APINULLGuid) {
+                attributeIds (CreateErrorResponse (APIERR_BADPARS,"Invalid attribute identifier.")); continue;
+            }
 
             Int32 index = -1;
-            if (data.Get ("index", index) && index >= 0) {
+            if (data.Contains ("index") && (!data.Get ("index", index) || index < 1)) {
+                attributeIds (CreateErrorResponse (APIERR_BADINDEX,"Attribute index must be a positive integer.")); continue;
+            }
+            if (index > 0) {
                 attr.header.index = ACAPI_CreateAttributeIndex (index);
             }
         }
 
-        bool doesExist = (ACAPI_Attribute_Get (&attr) == NoError);
-        if (doesExist && !overwriteExisting) {
+        const GSErrCode lookupError = ACAPI_Attribute_Get (&attr);
+        // Get allocates this location. Keep ownership even if a new texture name clears the candidate pointer.
+        IO::Location* fetchedTextureLocation=attrTypeID==API_MaterialID ? attr.material.texture.fileLoc : nullptr;
+        const GS::OnExit disposeTexture ([&] { delete fetchedTextureLocation; });
+        const bool doesExist = lookupError == NoError;
+        const bool explicitIdentity = (overwriteExisting || reuseMatching) && (data.Contains ("attributeId") || data.Contains ("index"));
+        if (!doesExist && (explicitIdentity || lookupError != APIERR_BADNAME)) {
+            attributeIds (CreateErrorResponse (lookupError,"Attribute lookup failed; this is not permission to create a replacement.")); continue;
+        }
+        if (doesExist && !overwriteExisting && !reuseMatching) {
             attributeIds (CreateErrorResponse (APIERR_ATTREXIST, "Already exists."));
             continue;
         }
 
+        const API_Attribute original=attr;
+        const GS::UniString originalName=name;
         // ACAPI_Attribute_Get writes the FOUND attribute's current name back through
         // uniStringNamePtr (it's an in/out pointer, not read-only) - when overwriteExisting finds an
         // existing attribute by guid/index, this clobbers whatever new name the caller asked for
@@ -2715,7 +2805,108 @@ GS::ObjectState CreateAttributesCommandBase::Execute (const GS::ObjectState& par
             attr.header.uniStringNamePtr = &name;
         }
 
-        SetTypeSpecificParameters (data, attr, attrDef);
+        const GSErrCode configurationError = SetTypeSpecificParameters (data, attr, attrDef);
+        if (configurationError != NoError) {
+            attributeIds (CreateErrorResponse (configurationError,"Invalid attribute configuration or dependency; no attribute written.")); continue;
+        }
+
+        if (doesExist && reuseMatching) {
+            bool matches=originalName==name && original.header.flags==attr.header.flags;
+            if (attrTypeID==API_LayerID) matches=matches && original.layer.conClassId==attr.layer.conClassId;
+            else if (attrTypeID==API_LayerCombID) {
+                API_AttributeDef originalDef={};
+                const GS::OnExit disposeOriginal ([&] { ACAPI_DisposeAttrDefsHdls (&originalDef); });
+                const GSErrCode readError=ACAPI_Attribute_GetDef (API_LayerCombID,original.header.index,&originalDef);
+                if (readError!=NoError || originalDef.layer_statItems==nullptr || attrDef.layer_statItems==nullptr) {
+                    attributeIds (CreateErrorResponse (readError==NoError ? APIERR_GENERAL : readError,"Cannot compare the existing layer combination; no changes made.")); continue;
+                }
+#ifdef ServerMainVers_2700
+                matches=matches && originalDef.layer_statItems->GetSize ()==attrDef.layer_statItems->GetSize ();
+                for (const auto& entry:*attrDef.layer_statItems) {
+#ifdef ServerMainVers_2800
+                    const auto key=entry.key; const auto& candidate=entry.value;
+#else
+                    const auto key=*entry.key; const auto& candidate=*entry.value;
+#endif
+                    if (!originalDef.layer_statItems->ContainsKey (key)) { matches=false; break; }
+                    const auto& previous=originalDef.layer_statItems->Get (key);
+                    if (previous.lFlags!=candidate.lFlags || previous.conClassId!=candidate.conClassId) { matches=false; break; }
+                }
+#else
+                matches=matches && original.layerComb.lNumb==attr.layerComb.lNumb;
+                if (BMhGetSize (reinterpret_cast<GSHandle> (originalDef.layer_statItems))<static_cast<GSSize> (original.layerComb.lNumb*sizeof(API_LayerStat))) matches=false;
+                if (matches) for (Int32 i=0;i<attr.layerComb.lNumb;++i) {
+                    const auto& candidate=(*attrDef.layer_statItems)[i]; bool found=false;
+                    for (Int32 j=0;j<original.layerComb.lNumb;++j) {
+                        const auto& previous=(*originalDef.layer_statItems)[j];
+                        if (previous.lInd==candidate.lInd) { found=previous.lFlags==candidate.lFlags && previous.conClassId==candidate.conClassId; break; }
+                    }
+                    if (!found) { matches=false; break; }
+                }
+#endif
+            }
+            else if (attrTypeID==API_LinetypeID) {
+                const auto& a=original.linetype; const auto& b=attr.linetype;
+                const auto number=[] (double x,double y) { return std::isfinite(x) && std::isfinite(y) && std::abs(x-y)<=1e-9; };
+                matches=matches && a.type==b.type && a.nItems==b.nItems && number(a.defineScale,b.defineScale) && number(a.period,b.period) && number(a.height,b.height);
+                API_AttributeDef previous={};
+                const GS::OnExit disposePrevious ([&] { ACAPI_DisposeAttrDefsHdls (&previous); });
+                const auto err=ACAPI_Attribute_GetDef (API_LinetypeID,original.header.index,&previous);
+                if (err!=NoError) { attributeIds (CreateErrorResponse (err,"Cannot compare the original line pattern.")); continue; }
+                if (matches && b.nItems>0 && b.type==APILine_DashedLine) {
+                    if (previous.ltype_dashItems==nullptr || attrDef.ltype_dashItems==nullptr ||
+                        BMhGetSize(reinterpret_cast<GSHandle>(previous.ltype_dashItems))<static_cast<GSSize>(b.nItems*sizeof(API_DashItems))) matches=false;
+                    else for (Int32 i=0;i<b.nItems && matches;++i) {
+                        const auto& x=(*previous.ltype_dashItems)[i]; const auto& y=(*attrDef.ltype_dashItems)[i];
+                        matches=number(x.dash,y.dash) && number(x.gap,y.gap);
+                    }
+                } else if (matches && b.nItems>0 && b.type==APILine_SymbolLine) {
+                    if (previous.ltype_lineItems==nullptr || attrDef.ltype_lineItems==nullptr ||
+                        BMhGetSize(reinterpret_cast<GSHandle>(previous.ltype_lineItems))<static_cast<GSSize>(b.nItems*sizeof(API_LineItems))) matches=false;
+                    else for (Int32 i=0;i<b.nItems && matches;++i) {
+                        const auto& x=(*previous.ltype_lineItems)[i]; const auto& y=(*attrDef.ltype_lineItems)[i];
+                        matches=x.itemType==y.itemType && number(x.itemCenterOffs,y.itemCenterOffs) && number(x.itemLength,y.itemLength) &&
+                            number(x.itemBegPos.x,y.itemBegPos.x) && number(x.itemBegPos.y,y.itemBegPos.y) && number(x.itemEndPos.x,y.itemEndPos.x) && number(x.itemEndPos.y,y.itemEndPos.y) &&
+                            number(x.itemRadius,y.itemRadius) && number(x.itemBegAngle,y.itemBegAngle) && number(x.itemEndAngle,y.itemEndAngle);
+                    }
+                }
+            }
+            else if (attrTypeID==API_MaterialID) {
+                const auto& a=original.material; const auto& b=attr.material;
+                const auto number=[] (double x,double y) { return std::isfinite(x) && std::isfinite(y) && std::abs(x-y)<=1e-9; };
+                const auto color=[&] (const API_RGBColor& x,const API_RGBColor& y) { return number(x.f_red,y.f_red) && number(x.f_green,y.f_green) && number(x.f_blue,y.f_blue); };
+                matches=matches && a.mtype==b.mtype && a.ambientPc==b.ambientPc && a.diffusePc==b.diffusePc && a.specularPc==b.specularPc &&
+                    a.transpPc==b.transpPc && a.shine==b.shine && a.transpAtt==b.transpAtt && a.emissionAtt==b.emissionAtt && a.ifill==b.ifill &&
+                    color(a.surfaceRGB,b.surfaceRGB) && color(a.specularRGB,b.specularRGB) && color(a.emissionRGB,b.emissionRGB) &&
+                    a.texture.status==b.texture.status && GS::UniString(a.texture.texName)==GS::UniString(b.texture.texName) &&
+                    number(a.texture.xSize,b.texture.xSize) && number(a.texture.ySize,b.texture.ySize) && number(a.texture.rotAng,b.texture.rotAng);
+            }
+            else if (attrTypeID==API_BuildingMaterialID) {
+                const auto& a=original.buildingMaterial; const auto& b=attr.buildingMaterial;
+                const auto text=[] (const GS::UniString* value) { return value!=nullptr ? *value : GS::UniString (); };
+                matches=matches && text(a.id)==text(b.id) && text(a.manufacturer)==text(b.manufacturer) && text(a.description)==text(b.description);
+#define MATERIAL_MATCH(field) matches=matches && a.field==b.field;
+                MATERIAL_MATCH(cutFill)
+                MATERIAL_MATCH(cutMaterial)
+                MATERIAL_MATCH(connPriority)
+                MATERIAL_MATCH(cutFillPen)
+                MATERIAL_MATCH(cutFillBackgroundPen)
+                MATERIAL_MATCH(cutFillOrientation)
+                MATERIAL_MATCH(showUncutLines)
+                MATERIAL_MATCH(doNotParticipateInCollDet)
+#undef MATERIAL_MATCH
+#define MATERIAL_NUMBER_MATCH(field) matches=matches && std::isfinite(a.field) && std::isfinite(b.field) && std::abs(a.field-b.field)<=1e-9;
+                MATERIAL_NUMBER_MATCH(thermalConductivity)
+                MATERIAL_NUMBER_MATCH(density)
+                MATERIAL_NUMBER_MATCH(heatCapacity)
+                MATERIAL_NUMBER_MATCH(embodiedEnergy)
+                MATERIAL_NUMBER_MATCH(embodiedCarbon)
+#undef MATERIAL_NUMBER_MATCH
+            }
+            if (!matches) { attributeIds (CreateErrorResponse (APIERR_ATTREXIST,"Existing attribute differs from the supplied settings; ReuseIfMatching makes no changes.")); continue; }
+            attributeIds (CreateAttributeIdObjectState (attr.header.guid));
+            continue;
+        }
 
         if (doesExist) {
             GSErrCode err = ACAPI_Attribute_Modify (&attr, &attrDef);
@@ -2731,8 +2922,6 @@ GS::ObjectState CreateAttributesCommandBase::Execute (const GS::ObjectState& par
             }
         }
 
-	    ACAPI_DisposeAttrDefsHdls (&attrDef);
-
         attributeIds (CreateAttributeIdObjectState (attr.header.guid));
     }
 
@@ -2747,112 +2936,145 @@ CreateBuildingMaterialsCommand::CreateBuildingMaterialsCommand () :
 GS::Optional<GS::UniString> CreateBuildingMaterialsCommand::GetInputParametersSchema () const
 {
     return R"({
-        "type": "object",
-        "properties": {
-            "buildingMaterialDataArray": {
-                "type": "array",
-                "description" : "Array of data to create new Building Materials.",
-                "items": {
-                    "type": "object",
-                    "description": "Data to create a Building Material.",
-                    "properties": {
-                        "attributeId": {
-                            "description": "Indentifier of the existing Building Material to overwrite, ignored if overwriteExisting is false.",
-                            "$ref": "#/AttributeId"
-                        },
-                        "index": {
-                            "type": "string",
-                            "description": "Index of the existing Building Material to overwrite, ignored if overwriteExisting is false."
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "Name. If overwriteExisting is true, then the existing Building Material with the given name will be overwritten."
-                        },
-                        "id": {
-                            "type": "string",
-                            "description": "Identifier."
-                        },
-                        "manufacturer": {
-                            "type": "string",
-                            "description": "Manufacturer."
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Decription."
-                        },
-                        "connPriority": {
-                            "type": "integer",
-                            "description": "Intersection priority."
-                        },
-                        "cutFillIndex": {
-                            "type": "integer",
-                            "description": "Index of the Cut Fill."
-                        },
-                        "cutFillPen": {
-                            "type": "integer",
-                            "description": "Cut Fill Foreground Pen."
-                        },
-                        "cutFillBackgroundPen": {
-                            "type": "integer",
-                            "description": "Cut Fill Background Pen."
-                        },
-                        "cutSurfaceIndex": {
-                            "type": "integer",
-                            "description": "Index of the Cut Surface."
-                        },
-                        "thermalConductivity": {
-                            "type": "number",
-                            "description": "Thermal Conductivity."
-                        },
-                        "density": {
-                            "type": "number",
-                            "description": "Density."
-                        },
-                        "heatCapacity": {
-                            "type": "number",
-                            "description": "Heat Capacity."
-                        },
-                        "embodiedEnergy": {
-                            "type": "number",
-                            "description": "Embodied Energy."
-                        },
-                        "embodiedCarbon": {
-                            "type": "number",
-                            "description": "Embodied Carbon."
-                        },
-                        "showUncutLines": {
-                            "type": "boolean",
-                            "description": "Show Contours in Model Views."
-                        },
-                        "collisionDetection": {
-                            "type": "boolean",
-                            "description": "Whether the Building Material participates in collision detection."
-                        },
-                        "cutFillOrientation": {
-                            "type": "string",
-                            "description": "ProjectOrigin, ElementOrigin, or FitToSkin. Orientation of the cut fill."
-                        }
+    "type": "object",
+    "properties": {
+        "buildingMaterialDataArray": {
+            "type": "array",
+            "description": "Array of data to create new Building Materials.",
+            "items": {
+                "type": "object",
+                "description": "Data to create a Building Material.",
+                "properties": {
+                    "attributeId": {
+                        "description": "Existing resource identity used with Overwrite or ReuseIfMatching. Specify only one identity selector.",
+                        "$ref": "#/AttributeId"
                     },
-                    "additionalProperties": false,
-                    "required" : [
-                        "name"
-                    ]
-                }
-            },
-            "overwriteExisting": {
-                "type": "boolean",
-                "description": "Overwrite the Building Material if exists with the same name, or if index is given with the same index. The default is false."
+                    "index": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Existing resource identity used with Overwrite or ReuseIfMatching. Specify only one identity selector."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name. If overwriteExisting is true, then the existing Building Material with the given name will be overwritten."
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "Identifier."
+                    },
+                    "manufacturer": {
+                        "type": "string",
+                        "description": "Manufacturer."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Decription."
+                    },
+                    "connPriority": {
+                        "type": "integer",
+                        "description": "Intersection priority."
+                    },
+                    "cutFillIndex": {
+                        "type": "integer",
+                        "description": "Index of the Cut Fill."
+                    },
+                    "cutFillPen": {
+                        "type": "integer",
+                        "description": "Cut Fill Foreground Pen."
+                    },
+                    "cutFillBackgroundPen": {
+                        "type": "integer",
+                        "description": "Cut Fill Background Pen."
+                    },
+                    "cutSurfaceIndex": {
+                        "type": "integer",
+                        "description": "Index of the Cut Surface."
+                    },
+                    "thermalConductivity": {
+                        "type": "number",
+                        "description": "Thermal Conductivity."
+                    },
+                    "density": {
+                        "type": "number",
+                        "description": "Density."
+                    },
+                    "heatCapacity": {
+                        "type": "number",
+                        "description": "Heat Capacity."
+                    },
+                    "embodiedEnergy": {
+                        "type": "number",
+                        "description": "Embodied Energy."
+                    },
+                    "embodiedCarbon": {
+                        "type": "number",
+                        "description": "Embodied Carbon."
+                    },
+                    "showUncutLines": {
+                        "type": "boolean",
+                        "description": "Show Contours in Model Views."
+                    },
+                    "collisionDetection": {
+                        "type": "boolean",
+                        "description": "Whether the Building Material participates in collision detection."
+                    },
+                    "cutFillOrientation": {
+                        "type": "string",
+                        "description": "ProjectOrigin, ElementOrigin, or FitToSkin. Orientation of the cut fill."
+                    }
+                },
+                "additionalProperties": false,
+                "required": [
+                    "name"
+                ]
             }
         },
-        "additionalProperties": false,
+        "overwriteExisting": {
+            "type": "boolean",
+            "description": "Overwrite the Building Material if exists with the same name, or if index is given with the same index. The default is false."
+        },
+        "ifExists": {
+            "enum": [
+                "Error",
+                "Overwrite",
+                "ReuseIfMatching"
+            ],
+            "description": "Explicit collision policy, mutually exclusive with overwriteExisting. ReuseIfMatching creates a missing named resource, reuses an existing one only when its name and supplied settings match, and reports a conflict otherwise. Omitted settings are retained, not assumed to have defaults. Numeric material comparison tolerance is 1e-9. Explicit missing identities fail."
+        }
+    },
+    "additionalProperties": false,
+    "required": [
+        "buildingMaterialDataArray"
+    ],
+    "not": {
         "required": [
-            "buildingMaterialDataArray"
+            "ifExists",
+            "overwriteExisting"
         ]
-    })";
+    }
+})";
 }
 
-void CreateBuildingMaterialsCommand::SetTypeSpecificParameters (const GS::ObjectState& parameters, API_Attribute& attribute, API_AttributeDef&) const
+GSErrCode CreateBuildingMaterialsCommand::SetTypeSpecificParameters (const GS::ObjectState& parameters, API_Attribute& attribute, API_AttributeDef&) const
 {
+    for (const auto& dependency : {std::pair<const char*,API_AttrTypeID> ("cutFillIndex",API_FilltypeID), {"cutSurfaceIndex",API_MaterialID}}) {
+        Int32 index=0;
+        if (!parameters.Contains (dependency.first)) continue;
+        if (!parameters.Get (dependency.first,index) || index < 1) return APIERR_BADINDEX;
+        API_Attribute ref = {}; ref.header.typeID=dependency.second; ref.header.index=ACAPI_CreateAttributeIndex (index);
+        const GSErrCode err=ACAPI_Attribute_Get (&ref);
+        if (err != NoError) return err;
+    }
+    for (const char* key : {"thermalConductivity","density","heatCapacity","embodiedEnergy","embodiedCarbon"}) {
+        double value=0;
+        if (parameters.Contains (key) && (!parameters.Get (key,value) || !std::isfinite (value) || (value < 0 && std::strcmp (key,"embodiedCarbon") != 0))) return APIERR_BADPARS;
+    }
+    for (const char* key : {"cutFillPen","cutFillBackgroundPen"}) {
+        Int32 value=0;
+        if (parameters.Contains (key) && (!parameters.Get (key,value) || value < -1 || value > 255)) return APIERR_BADPARS;
+    }
+    GS::UniString orientation;
+    if (parameters.Get ("cutFillOrientation",orientation) && orientation!="ProjectOrigin" && orientation!="ElementOrigin" && orientation!="FitToSkin") return APIERR_BADPARS;
     static GS::UniString id;
     if (parameters.Get ("id", id)) {
         attribute.buildingMaterial.id = &id;
@@ -2875,7 +3097,9 @@ void CreateBuildingMaterialsCommand::SetTypeSpecificParameters (const GS::Object
 
     Int32 connPriority;
     if (parameters.Get ("connPriority", connPriority)) {
-        ACAPI_Element_UI2ElemPriority (&connPriority, &attribute.buildingMaterial.connPriority);
+        if (connPriority < 0 || connPriority > 999) return APIERR_BADPARS;
+        const GSErrCode err=ACAPI_Element_UI2ElemPriority (&connPriority, &attribute.buildingMaterial.connPriority);
+        if (err != NoError) return err;
     }
 
     short cutFillPen;
@@ -2934,6 +3158,7 @@ void CreateBuildingMaterialsCommand::SetTypeSpecificParameters (const GS::Object
         else
             attribute.buildingMaterial.cutFillOrientation = APIFillOrientation_ProjectOrigin;
     }
+    return NoError;
 }
 
 CreateLayersCommand::CreateLayersCommand () :
@@ -2944,63 +3169,80 @@ CreateLayersCommand::CreateLayersCommand () :
 GS::Optional<GS::UniString> CreateLayersCommand::GetInputParametersSchema () const
 {
     return R"({
-        "type": "object",
-        "properties": {
-            "layerDataArray": {
-                "type": "array",
-                "description" : "Array of data to create new Layers.",
-                "items": {
-                    "type": "object",
-                    "description": "Data to create a Layer.",
-                    "properties": {
-                        "attributeId": {
-                            "description": "Indentifier of the existing Layer to overwrite, ignored if overwriteExisting is false.",
-                            "$ref": "#/AttributeId"
-                        },
-                        "index": {
-                            "type": "string",
-                            "description": "Index of the existing Layer to overwrite, ignored if overwriteExisting is false."
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "Name. If overwriteExisting is true, then the existing Layer with the given name will be overwritten."
-                        },
-                        "isHidden": {
-                            "type": "boolean",
-                            "description": "Hide/Show."
-                        },
-                        "isLocked": {
-                            "type": "boolean",
-                            "description": "Lock/Unlock."
-                        },
-                        "isWireframe": {
-                            "type": "boolean",
-                            "description": "Force the model to wireframe."
-                        },
-                        "intersectionGroupNr": {
-                            "type": "integer",
-                            "description": "Intersection group. Elements on layers having the same group will be intersected."
-                        }
+    "type": "object",
+    "properties": {
+        "layerDataArray": {
+            "type": "array",
+            "description": "Array of data to create new Layers.",
+            "items": {
+                "type": "object",
+                "description": "Data to create a Layer.",
+                "properties": {
+                    "attributeId": {
+                        "description": "Existing resource identity used with Overwrite or ReuseIfMatching. Specify only one identity selector.",
+                        "$ref": "#/AttributeId"
                     },
-                    "additionalProperties": false,
-                    "required" : [
-                        "name"
-                    ]
-                }
-            },
-            "overwriteExisting": {
-                "type": "boolean",
-                "description": "Overwrite the Layer if exists with the same name, or if index is given with the same index. The default is false."
+                    "index": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Existing resource identity used with Overwrite or ReuseIfMatching. Specify only one identity selector."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name. If overwriteExisting is true, then the existing Layer with the given name will be overwritten."
+                    },
+                    "isHidden": {
+                        "type": "boolean",
+                        "description": "Hide/Show."
+                    },
+                    "isLocked": {
+                        "type": "boolean",
+                        "description": "Lock/Unlock."
+                    },
+                    "isWireframe": {
+                        "type": "boolean",
+                        "description": "Force the model to wireframe."
+                    },
+                    "intersectionGroupNr": {
+                        "type": "integer",
+                        "description": "Intersection group. Elements on layers having the same group will be intersected.",
+                        "minimum": 0,
+                        "maximum": 32767
+                    }
+                },
+                "additionalProperties": false,
+                "required": [
+                    "name"
+                ]
             }
         },
-        "additionalProperties": false,
+        "overwriteExisting": {
+            "type": "boolean",
+            "description": "Overwrite the Layer if exists with the same name, or if index is given with the same index. The default is false."
+        },
+        "ifExists": {
+            "enum": [
+                "Error",
+                "Overwrite",
+                "ReuseIfMatching"
+            ],
+            "description": "Explicit collision policy, mutually exclusive with overwriteExisting. ReuseIfMatching creates a missing named resource, reuses an existing one only when its name and supplied settings match, and reports a conflict otherwise. Omitted settings are retained, not assumed to have defaults. Numeric material comparison tolerance is 1e-9. Explicit missing identities fail."
+        }
+    },
+    "additionalProperties": false,
+    "required": [
+        "layerDataArray"
+    ],
+    "not": {
         "required": [
-            "layerDataArray"
+            "ifExists",
+            "overwriteExisting"
         ]
-    })";
+    }
+})";
 }
 
-void CreateLayersCommand::SetTypeSpecificParameters (const GS::ObjectState& parameters, API_Attribute& attribute, API_AttributeDef&) const
+GSErrCode CreateLayersCommand::SetTypeSpecificParameters (const GS::ObjectState& parameters, API_Attribute& attribute, API_AttributeDef&) const
 {
     bool hidden;
     if (parameters.Get ("isHidden", hidden)) {
@@ -3026,7 +3268,12 @@ void CreateLayersCommand::SetTypeSpecificParameters (const GS::ObjectState& para
             attribute.header.flags &= ~APILay_ForceToWire;
     }
 
-    parameters.Get ("intersectionGroupNr", attribute.layer.conClassId);
+    if (parameters.Contains ("intersectionGroupNr")) {
+        Int32 group=0;
+        if (!parameters.Get ("intersectionGroupNr",group) || group<0 || group>32767) return APIERR_BADPARS;
+        attribute.layer.conClassId=static_cast<short> (group);
+    }
+    return NoError;
 }
 
 CreateLayerCombinationsCommand::CreateLayerCombinationsCommand () :
@@ -3037,48 +3284,63 @@ CreateLayerCombinationsCommand::CreateLayerCombinationsCommand () :
 GS::Optional<GS::UniString> CreateLayerCombinationsCommand::GetInputParametersSchema () const
 {
     return R"({
-        "type": "object",
-        "properties": {
-            "layerCombinationDataArray": {
-                "type": "array",
-                "description" : "Array of data to create new Layer Combinations.",
-                "items": {
-                    "type": "object",
-                    "description": "Data to create a Layer Combination.",
-                    "properties": {
-                        "attributeId": {
-                            "description": "Indentifier of the existing Layer Combination to overwrite, ignored if overwriteExisting is false.",
-                            "$ref": "#/AttributeId"
-                        },
-                        "index": {
-                            "type": "string",
-                            "description": "Index of the existing Layer Combination to overwrite, ignored if overwriteExisting is false."
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "Name. If overwriteExisting is true, then the existing Layer Combination with the given name will be overwritten."
-                        },
-                        "layers": {
-                            "$ref": "#/LayersOfLayerCombination"
-                        }
+    "type": "object",
+    "properties": {
+        "layerCombinationDataArray": {
+            "type": "array",
+            "description": "Array of data to create new Layer Combinations.",
+            "items": {
+                "type": "object",
+                "description": "Data to create a Layer Combination.",
+                "properties": {
+                    "attributeId": {
+                        "description": "Existing combination identity used with Overwrite or ReuseIfMatching. Specify only one identity selector.",
+                        "$ref": "#/AttributeId"
                     },
-                    "additionalProperties": false,
-                    "required" : [
-                        "name",
-                        "layers"
-                    ]
-                }
-            },
-            "overwriteExisting": {
-                "type": "boolean",
-                "description": "Overwrite the Layer Combination if exists with the same guid/index/name. The default is false."
+                    "index": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Existing combination identity used with Overwrite or ReuseIfMatching. Specify only one identity selector."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name. If overwriteExisting is true, then the existing Layer Combination with the given name will be overwritten."
+                    },
+                    "layers": {
+                        "$ref": "#/LayersOfLayerCombination"
+                    }
+                },
+                "additionalProperties": false,
+                "required": [
+                    "name",
+                    "layers"
+                ]
             }
         },
-        "additionalProperties": false,
+        "overwriteExisting": {
+            "type": "boolean",
+            "description": "Overwrite the Layer Combination if exists with the same guid/index/name. The default is false."
+        },
+        "ifExists": {
+            "enum": [
+                "Error",
+                "Overwrite",
+                "ReuseIfMatching"
+            ],
+            "description": "Mutually exclusive with overwriteExisting. ReuseIfMatching returns the existing combination only when name and resulting layer states match; unmentioned states are retained. Missing named combinations are created. Differences and missing explicit identities return errors without writing."
+        }
+    },
+    "additionalProperties": false,
+    "required": [
+        "layerCombinationDataArray"
+    ],
+    "not": {
         "required": [
-            "layerCombinationDataArray"
+            "ifExists",
+            "overwriteExisting"
         ]
-    })";
+    }
+})";
 }
 
 // A layer combination's stat table is NOT sparse: per the AC27 devkit's own remark on
@@ -3102,7 +3364,7 @@ static API_LayerStat DefaultLayerStat ()
     return layerStat;
 }
 
-void CreateLayerCombinationsCommand::SetTypeSpecificParameters (const GS::ObjectState& parameters, API_Attribute& attribute, API_AttributeDef& attributeDef) const
+GSErrCode CreateLayerCombinationsCommand::SetTypeSpecificParameters (const GS::ObjectState& parameters, API_Attribute& attribute, API_AttributeDef& attributeDef) const
 {
     GS::Array<GS::ObjectState> layers;
     parameters.Get ("layers", layers);
@@ -3113,9 +3375,11 @@ void CreateLayerCombinationsCommand::SetTypeSpecificParameters (const GS::Object
     // than being reset to defaults on every edit.
     GS::HashTable<API_AttributeIndex, API_LayerStat> seedStats;
     API_AttributeDef existingDef = {};
-    bool hasExistingDef = false;
-    if (attribute.header.index != APIInvalidAttributeIndex && ACAPI_Attribute_GetDef (API_LayerCombID, attribute.header.index, &existingDef) == NoError) {
-        hasExistingDef = true;
+    const GS::OnExit disposeExisting ([&] { ACAPI_DisposeAttrDefsHdls (&existingDef); });
+    if (IsPositiveAttributeIndex (attribute.header.index)) {
+        const GSErrCode err = ACAPI_Attribute_GetDef (API_LayerCombID,attribute.header.index,&existingDef);
+        if (err != NoError) return err;
+        if (existingDef.layer_statItems == nullptr) return APIERR_GENERAL;
 #ifdef ServerMainVers_2700
         for (const auto& kv : *existingDef.layer_statItems) {
 #ifdef ServerMainVers_2800
@@ -3133,7 +3397,8 @@ void CreateLayerCombinationsCommand::SetTypeSpecificParameters (const GS::Object
     }
 
     GS::Array<API_Attribute> allLayers;
-    ACAPI_Attribute_GetAttributesByType (API_LayerID, allLayers);
+    const GSErrCode enumerationError = ACAPI_Attribute_GetAttributesByType (API_LayerID, allLayers);
+    if (enumerationError != NoError) return enumerationError;
     for (API_Attribute& layerAttr : allLayers) {
         if (!seedStats.ContainsKey (layerAttr.header.index)) {
             seedStats.Add (layerAttr.header.index, DefaultLayerStat ());
@@ -3141,37 +3406,23 @@ void CreateLayerCombinationsCommand::SetTypeSpecificParameters (const GS::Object
         DisposeAttribute (layerAttr);
     }
 
+    GS::HashSet<API_AttributeIndex> seen;
     for (const GS::ObjectState& layer : layers) {
-        API_LayerStat layerStat = DefaultLayerStat ();
-
-        bool isHidden = false;
-        layer.Get ("isHidden", isHidden);
-        if (isHidden)
-            layerStat.lFlags |= APILay_Hidden;
-
-        bool isLocked = false;
-        layer.Get ("isLocked", isLocked);
-        if (isLocked)
-            layerStat.lFlags |= APILay_Locked;
-
-        bool isWireframe = false;
-        layer.Get ("isWireframe", isWireframe);
-        if (isWireframe)
-            layerStat.lFlags |= APILay_ForceToWire;
-
-        Int32 intersectionGroupNr = 1;
-        layer.Get ("intersectionGroupNr", intersectionGroupNr);
-        layerStat.conClassId = intersectionGroupNr;
-
-        API_AttributeIndex layerIndex;
-        if (GetAttributeIndexFromAttributeId (layer, API_LayerID, layerIndex)) {
-            // Put, not Add: this layer's key was already seeded above with a default stat (every
-            // project layer is seeded first), and GS::HashTable::Add is a no-op returning false
-            // when the key already exists - it does NOT overwrite. Confirmed live: using Add here
-            // silently dropped every override, leaving the seeded defaults in place even though
-            // the request came back accepted. Put unconditionally replaces the existing entry.
-            seedStats.Put (layerIndex, layerStat);
+        API_AttributeIndex layerIndex; GSErrCode lookupError=NoError;
+        if (!GetAttributeIndexFromAttributeId (layer,API_LayerID,layerIndex,&lookupError)) return lookupError;
+        if (seen.Contains (layerIndex)) return APIERR_BADPARS;
+        seen.Add (layerIndex);
+        API_LayerStat layerStat = seedStats.ContainsKey (layerIndex) ? seedStats.Get (layerIndex) : DefaultLayerStat ();
+        bool flag=false;
+        if (layer.Get ("isHidden",flag)) layerStat.lFlags=flag ? layerStat.lFlags | APILay_Hidden : layerStat.lFlags & ~APILay_Hidden;
+        if (layer.Get ("isLocked",flag)) layerStat.lFlags=flag ? layerStat.lFlags | APILay_Locked : layerStat.lFlags & ~APILay_Locked;
+        if (layer.Get ("isWireframe",flag)) layerStat.lFlags=flag ? layerStat.lFlags | APILay_ForceToWire : layerStat.lFlags & ~APILay_ForceToWire;
+        Int32 group=0;
+        if (layer.Get ("intersectionGroupNr",group)) {
+            if (group < 0 || group > 32767) return APIERR_BADPARS;
+            layerStat.conClassId=group;
         }
+        seedStats.Put (layerIndex,layerStat);
     }
 
     attribute.layerComb.lNumb = static_cast<Int32> (seedStats.GetSize ());
@@ -3180,6 +3431,7 @@ void CreateLayerCombinationsCommand::SetTypeSpecificParameters (const GS::Object
     attributeDef.layer_statItems = new GS::HashTable<API_AttributeIndex, API_LayerStat> (seedStats);
 #else
     attributeDef.layer_statItems = (API_LayerStat **) BMAllocateHandle (attribute.layerComb.lNumb * sizeof (API_LayerStat), ALLOCATE_CLEAR, 0);
+    if (attributeDef.layer_statItems == nullptr) return APIERR_MEMFULL;
     Int32 i = 0;
     for (const auto& kv : seedStats) {
         // Pre-2700 GS::HashTable's const range-for pair exposes pointer members (unlike 2800+'s
@@ -3190,9 +3442,7 @@ void CreateLayerCombinationsCommand::SetTypeSpecificParameters (const GS::Object
     }
 #endif
 
-    if (hasExistingDef) {
-        ACAPI_DisposeAttrDefsHdls (&existingDef);
-    }
+    return NoError;
 }
 
 CreateLinesCommand::CreateLinesCommand () :
@@ -3203,129 +3453,157 @@ CreateLinesCommand::CreateLinesCommand () :
 GS::Optional<GS::UniString> CreateLinesCommand::GetInputParametersSchema () const
 {
     return R"({
-        "type": "object",
-        "properties": {
-            "lineDataArray": {
-                "type": "array",
-                "description" : "Array of data to create new Lines.",
-                "items": {
-                    "type": "object",
-                    "description": "Data to create a Line.",
-                    "properties": {
-                        "attributeId": {
-                            "description": "Indentifier of the existing Line to overwrite, ignored if overwriteExisting is false.",
-                            "$ref": "#/AttributeId"
-                        },
-                        "index": {
-                            "type": "string",
-                            "description": "Index of the existing Line to overwrite, ignored if overwriteExisting is false."
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "Name. If overwriteExisting is true, then the existing Line with the given name will be overwritten."
-                        },
-                        "scaleWithPlan": {
-                            "type": "boolean",
-                            "description": "If true, the line type parameters are defined in meters at the given defineScale and scale on printout with the actual plan scale. If false (default), the parameters are fixed values in millimeters as the line will appear on the printout."
-                        },
-                        "defineScale": {
-                            "type": "number",
-                            "description": "The floor plan scale the line type is defined with. Only used if scaleWithPlan is true."
-                        },
-                        "lineType": {
-                            "type": "string",
-                            "description": "Solid, Dashed, or Symbol. Defaults to Solid."
-                        },
-                        "period": {
-                            "type": "number",
-                            "description": "The length of one period (Dashed and Symbol line types)."
-                        },
-                        "height": {
-                            "type": "number",
-                            "description": "The height of the symbol line (Symbol line type only)."
-                        },
-                        "dashItems": {
-                            "type": "array",
-                            "description": "Dash-gap pairs describing one period (Dashed line type only).",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "dash": {
-                                        "type": "number",
-                                        "description": "Length of the visible part of the item."
-                                    },
-                                    "gap": {
-                                        "type": "number",
-                                        "description": "Length of the invisible part of the item."
-                                    }
-                                },
-                                "additionalProperties": false,
-                                "required": ["dash", "gap"]
-                            }
-                        },
-                        "lineItems": {
-                            "type": "array",
-                            "description": "Symbol items describing one period (Symbol line type only).",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "itemType": {
-                                        "type": "string",
-                                        "description": "Separator, CenterDot, CenterLine, Dot, RightAngle, Parallel, Line, Circle, or Arc."
-                                    },
-                                    "centerOffset": {
-                                        "type": "number",
-                                        "description": "Vertical distance from the origin. Used for Separator, CenterDot, and CenterLine item types."
-                                    },
-                                    "length": {
-                                        "type": "number",
-                                        "description": "Length of the item. Used for CenterLine, RightAngle, and Parallel item types."
-                                    },
-                                    "begPos": {
-                                        "description": "Beginning position. Used for Dot, RightAngle, Parallel, Line, Circle, and Arc item types.",
-                                        "$ref": "#/Coordinate2D"
-                                    },
-                                    "endPos": {
-                                        "description": "End position. Used for Line item type only.",
-                                        "$ref": "#/Coordinate2D"
-                                    },
-                                    "radius": {
-                                        "type": "number",
-                                        "description": "Radius. Used for Circle and Arc item types."
-                                    },
-                                    "beginAngle": {
-                                        "type": "number",
-                                        "description": "Beginning angle in radians, measured from the vertical axis. Used for Arc item type only."
-                                    },
-                                    "endAngle": {
-                                        "type": "number",
-                                        "description": "End angle in radians, measured from the vertical axis. Used for Arc item type only."
-                                    }
-                                },
-                                "additionalProperties": false,
-                                "required": ["itemType"]
-                            }
-                        }
+    "type": "object",
+    "properties": {
+        "lineDataArray": {
+            "type": "array",
+            "description": "Array of data to create new Lines.",
+            "items": {
+                "type": "object",
+                "description": "Data to create a Line.",
+                "properties": {
+                    "attributeId": {
+                        "description": "Existing line type identity for Overwrite or ReuseIfMatching. Specify only one identity selector.",
+                        "$ref": "#/AttributeId"
                     },
-                    "additionalProperties": false,
-                    "required" : [
-                        "name"
-                    ]
-                }
-            },
-            "overwriteExisting": {
-                "type": "boolean",
-                "description": "Overwrite the Line if exists with the same name, or if index is given with the same index. The default is false."
+                    "index": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Existing line type identity for Overwrite or ReuseIfMatching. Specify only one identity selector."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name. If overwriteExisting is true, then the existing Line with the given name will be overwritten."
+                    },
+                    "scaleWithPlan": {
+                        "type": "boolean",
+                        "description": "If true, the line type parameters are defined in meters at the given defineScale and scale on printout with the actual plan scale. If false (default), the parameters are fixed values in millimeters as the line will appear on the printout."
+                    },
+                    "defineScale": {
+                        "type": "number",
+                        "description": "The floor plan scale the line type is defined with. Only used if scaleWithPlan is true.",
+                        "exclusiveMinimum": 0
+                    },
+                    "lineType": {
+                        "type": "string",
+                        "description": "Solid, Dashed, or Symbol. Defaults to Solid."
+                    },
+                    "period": {
+                        "type": "number",
+                        "description": "The length of one period (Dashed and Symbol line types).",
+                        "exclusiveMinimum": 0
+                    },
+                    "height": {
+                        "type": "number",
+                        "description": "The height of the symbol line (Symbol line type only).",
+                        "minimum": 0
+                    },
+                    "dashItems": {
+                        "type": "array",
+                        "description": "Dash-gap pairs describing one period (Dashed line type only).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "dash": {
+                                    "type": "number",
+                                    "description": "Length of the visible part of the item."
+                                },
+                                "gap": {
+                                    "type": "number",
+                                    "description": "Length of the invisible part of the item."
+                                }
+                            },
+                            "additionalProperties": false,
+                            "required": [
+                                "dash",
+                                "gap"
+                            ]
+                        },
+                        "minItems": 1,
+                        "maxItems": 10000
+                    },
+                    "lineItems": {
+                        "type": "array",
+                        "description": "Symbol items describing one period (Symbol line type only).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "itemType": {
+                                    "type": "string",
+                                    "description": "Separator, CenterDot, CenterLine, Dot, RightAngle, Parallel, Line, Circle, or Arc."
+                                },
+                                "centerOffset": {
+                                    "type": "number",
+                                    "description": "Vertical distance from the origin. Used for Separator, CenterDot, and CenterLine item types."
+                                },
+                                "length": {
+                                    "type": "number",
+                                    "description": "Length of the item. Used for CenterLine, RightAngle, and Parallel item types."
+                                },
+                                "begPos": {
+                                    "description": "Beginning position. Used for Dot, RightAngle, Parallel, Line, Circle, and Arc item types.",
+                                    "$ref": "#/Coordinate2D"
+                                },
+                                "endPos": {
+                                    "description": "End position. Used for Line item type only.",
+                                    "$ref": "#/Coordinate2D"
+                                },
+                                "radius": {
+                                    "type": "number",
+                                    "description": "Radius. Used for Circle and Arc item types."
+                                },
+                                "beginAngle": {
+                                    "type": "number",
+                                    "description": "Beginning angle in radians, measured from the vertical axis. Used for Arc item type only."
+                                },
+                                "endAngle": {
+                                    "type": "number",
+                                    "description": "End angle in radians, measured from the vertical axis. Used for Arc item type only."
+                                }
+                            },
+                            "additionalProperties": false,
+                            "required": [
+                                "itemType"
+                            ]
+                        },
+                        "minItems": 1,
+                        "maxItems": 10000
+                    }
+                },
+                "additionalProperties": false,
+                "required": [
+                    "name"
+                ]
             }
         },
-        "additionalProperties": false,
+        "overwriteExisting": {
+            "type": "boolean",
+            "description": "Overwrite the Line if exists with the same name, or if index is given with the same index. The default is false."
+        },
+        "ifExists": {
+            "type": "string",
+            "enum": [
+                "Error",
+                "Overwrite",
+                "ReuseIfMatching"
+            ],
+            "description": "Mutually exclusive with overwriteExisting. ReuseIfMatching compares name, flags, scale and complete dash/symbol pattern, tolerance 1e-9. Unmentioned settings retain their existing values. A mismatch makes no changes; a missing named line is created."
+        }
+    },
+    "additionalProperties": false,
+    "required": [
+        "lineDataArray"
+    ],
+    "not": {
         "required": [
-            "lineDataArray"
+            "ifExists",
+            "overwriteExisting"
         ]
-    })";
+    }
+})";
 }
 
-void CreateLinesCommand::SetTypeSpecificParameters (const GS::ObjectState& parameters, API_Attribute& attribute, API_AttributeDef& attributeDef) const
+GSErrCode CreateLinesCommand::SetTypeSpecificParameters (const GS::ObjectState& parameters, API_Attribute& attribute, API_AttributeDef& attributeDef) const
 {
     bool scaleWithPlan = false;
     if (parameters.Get ("scaleWithPlan", scaleWithPlan)) {
@@ -3338,7 +3616,9 @@ void CreateLinesCommand::SetTypeSpecificParameters (const GS::ObjectState& param
         }
     }
 
+    if (!IsPositiveAttributeIndex(attribute.header.index)) attribute.linetype.defineScale=1.0;
     parameters.Get ("defineScale", attribute.linetype.defineScale);
+    if (!std::isfinite(attribute.linetype.defineScale) || attribute.linetype.defineScale<=0) return APIERR_BADPARS;
 
     // Seed the dash/symbol item Ext handles from the line being overwritten (if any), so a modify call that
     // doesn't touch lineType/dashItems/lineItems doesn't leave attribute.linetype.nItems (already preserved via
@@ -3347,21 +3627,22 @@ void CreateLinesCommand::SetTypeSpecificParameters (const GS::ObjectState& param
     // existing attribute, paired with a freshly zero-initialized handle for this call, is an inconsistent state
     // Archicad rejects). Only relevant when overwriting an existing line; a brand new one has nothing to seed.
     if (IsPositiveAttributeIndex (attribute.header.index)) {
-        API_AttributeDef existingDef = {};
-        if (ACAPI_Attribute_GetDef (API_LinetypeID, attribute.header.index, &existingDef) == NoError) {
-            attributeDef.ltype_dashItems = existingDef.ltype_dashItems;
-            attributeDef.ltype_lineItems = existingDef.ltype_lineItems;
-        }
+        const auto readError=ACAPI_Attribute_GetDef (API_LinetypeID,attribute.header.index,&attributeDef);
+        if (readError!=NoError) return readError;
     }
 
     // Only touch linetype.type (and the period/height/dashItems/lineItems that go with it) if lineType was
     // actually supplied, so an overwriteExisting call that only changes e.g. defineScale doesn't silently
     // convert an existing Dashed or Symbol line back to Solid (APILine_SolidLine is 0, i.e. the zero-initialized
     // default, so a brand new line with no lineType still correctly comes out Solid).
-    GS::UniString lineType;
-    if (!parameters.Get ("lineType", lineType)) {
-        return;
-    }
+    GS::UniString lineType=attribute.linetype.type==APILine_DashedLine ? "Dashed" : attribute.linetype.type==APILine_SymbolLine ? "Symbol" : "Solid";
+    parameters.Get ("lineType",lineType);
+    if ((parameters.Contains("dashItems") && lineType!="Dashed") || (parameters.Contains("lineItems") && lineType!="Symbol") ||
+        (parameters.Contains("height") && lineType!="Symbol") || (parameters.Contains("period") && lineType=="Solid")) return APIERR_BADPARS;
+    const auto originalType=attribute.linetype.type;
+    if (lineType!="Dashed" && lineType!="Symbol" && lineType!="Solid") return APIERR_BADPARS;
+    if ((lineType=="Dashed" && originalType!=APILine_DashedLine && !parameters.Contains("dashItems")) ||
+        (lineType=="Symbol" && originalType!=APILine_SymbolLine && !parameters.Contains("lineItems"))) return APIERR_BADPARS;
 
     if (lineType == "Dashed") {
         attribute.linetype.type = APILine_DashedLine;
@@ -3373,14 +3654,18 @@ void CreateLinesCommand::SetTypeSpecificParameters (const GS::ObjectState& param
         GS::Array<GS::ObjectState> dashItems;
         if (parameters.Get ("dashItems", dashItems)) {
             UInt32 nItems = dashItems.GetSize ();
+            if (nItems<1 || nItems>10000) return APIERR_BADPARS;
+            BMKillHandle (reinterpret_cast<GSHandle*> (&attributeDef.ltype_dashItems));
             attribute.linetype.nItems = (Int32) nItems;
 
             if (nItems > 0) {
                 attributeDef.ltype_dashItems = (API_DashItems**) BMAllocateHandle (nItems * sizeof (API_DashItems), ALLOCATE_CLEAR, 0);
+                if (attributeDef.ltype_dashItems==nullptr) return APIERR_MEMFULL;
                 for (UInt32 i = 0; i < nItems; ++i) {
                     API_DashItems& item = (*attributeDef.ltype_dashItems)[i];
                     dashItems[i].Get ("dash", item.dash);
                     dashItems[i].Get ("gap", item.gap);
+                    if (!std::isfinite(item.dash) || !std::isfinite(item.gap) || item.dash<0 || item.gap<0 || item.dash+item.gap<=0) return APIERR_BADPARS;
                 }
             }
         }
@@ -3393,10 +3678,13 @@ void CreateLinesCommand::SetTypeSpecificParameters (const GS::ObjectState& param
         GS::Array<GS::ObjectState> lineItems;
         if (parameters.Get ("lineItems", lineItems)) {
             UInt32 nItems = lineItems.GetSize ();
+            if (nItems<1 || nItems>10000) return APIERR_BADPARS;
+            BMKillHandle (reinterpret_cast<GSHandle*> (&attributeDef.ltype_lineItems));
             attribute.linetype.nItems = (Int32) nItems;
 
             if (nItems > 0) {
                 attributeDef.ltype_lineItems = (API_LineItems**) BMAllocateHandle (nItems * sizeof (API_LineItems), ALLOCATE_CLEAR, 0);
+                if (attributeDef.ltype_lineItems==nullptr) return APIERR_MEMFULL;
                 for (UInt32 i = 0; i < nItems; ++i) {
                     API_LineItems& item = (*attributeDef.ltype_lineItems)[i];
                     const GS::ObjectState& itemData = lineItems[i];
@@ -3419,8 +3707,9 @@ void CreateLinesCommand::SetTypeSpecificParameters (const GS::ObjectState& param
                         item.itemType = APILine_CircItemType;
                     else if (itemType == "Arc")
                         item.itemType = APILine_ArcItemType;
-                    else
+                    else if (itemType=="Line")
                         item.itemType = APILine_LineItemType;
+                    else return APIERR_BADPARS;
 
                     itemData.Get ("centerOffset", item.itemCenterOffs);
                     itemData.Get ("length", item.itemLength);
@@ -3433,12 +3722,25 @@ void CreateLinesCommand::SetTypeSpecificParameters (const GS::ObjectState& param
                     itemData.Get ("radius", item.itemRadius);
                     itemData.Get ("beginAngle", item.itemBegAngle);
                     itemData.Get ("endAngle", item.itemEndAngle);
+                    if (!std::isfinite(item.itemCenterOffs) || !std::isfinite(item.itemLength) || !std::isfinite(item.itemBegPos.x) || !std::isfinite(item.itemBegPos.y) ||
+                        !std::isfinite(item.itemEndPos.x) || !std::isfinite(item.itemEndPos.y) || !std::isfinite(item.itemRadius) || !std::isfinite(item.itemBegAngle) || !std::isfinite(item.itemEndAngle)) return APIERR_BADPARS;
                 }
             }
         }
     } else {
         attribute.linetype.type = APILine_SolidLine;
+        attribute.linetype.nItems=0; attribute.linetype.period=0; attribute.linetype.height=0;
     }
+    if (attribute.linetype.type!=APILine_DashedLine) BMKillHandle (reinterpret_cast<GSHandle*> (&attributeDef.ltype_dashItems));
+    if (attribute.linetype.type!=APILine_SymbolLine) BMKillHandle (reinterpret_cast<GSHandle*> (&attributeDef.ltype_lineItems));
+    if (attribute.linetype.type==APILine_DashedLine) attribute.linetype.height=0;
+    if (attribute.linetype.type!=APILine_SolidLine) {
+        if (attribute.linetype.nItems<1 || attribute.linetype.nItems>10000 || !std::isfinite(attribute.linetype.period) || attribute.linetype.period<=0 || !std::isfinite(attribute.linetype.height) || attribute.linetype.height<0) return APIERR_BADPARS;
+        const auto handle=attribute.linetype.type==APILine_DashedLine ? reinterpret_cast<GSHandle>(attributeDef.ltype_dashItems) : reinterpret_cast<GSHandle>(attributeDef.ltype_lineItems);
+        const auto itemSize=attribute.linetype.type==APILine_DashedLine ? sizeof(API_DashItems) : sizeof(API_LineItems);
+        if (handle==nullptr || BMhGetSize(handle)<static_cast<GSSize>(attribute.linetype.nItems*itemSize)) return APIERR_BADPARS;
+    }
+    return NoError;
 }
 
 CreateFillsCommand::CreateFillsCommand () :
@@ -3454,167 +3756,249 @@ GS::String CreateFillsCommand::GetName () const
 GS::Optional<GS::UniString> CreateFillsCommand::GetInputParametersSchema () const
 {
     return R"({
-        "type": "object",
-        "properties": {
-            "fillDataArray": {
-                "type": "array",
-                "description" : "Array of data to create new Fills.",
-                "items": {
-                    "type": "object",
-                    "description": "Data to create a Fill.",
-                    "properties": {
-                        "attributeId": {
-                            "description": "Indentifier of the existing Fill to overwrite, ignored if overwriteExisting is false.",
-                            "$ref": "#/AttributeId"
-                        },
-                        "index": {
-                            "type": "string",
-                            "description": "Index of the existing Fill to overwrite, ignored if overwriteExisting is false."
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "Name. If overwriteExisting is true, then the existing Fill with the given name will be overwritten."
-                        },
-                        "subType": {
-                            "type": "string",
-                            "description": "Vector, Solid, Empty, Symbol, LinearGradient, RadialGradient, or Image. Defaults to Vector. Only one Solid and one Empty fill may exist. Image fills use the texture field's name to reference the image library part."
-                        },
-                        "scaleWithPlan": {
-                            "type": "boolean",
-                            "description": "The fill is scale dependent."
-                        },
-                        "useForWalls": {
-                            "type": "boolean",
-                            "description": "This fill can be used for cut fills."
-                        },
-                        "useForDraft": {
-                            "type": "boolean",
-                            "description": "This fill can be used for drafting fills."
-                        },
-                        "useForCover": {
-                            "type": "boolean",
-                            "description": "This fill can be used for cover fills."
-                        },
-                        "horizontalSpacing": {
-                            "type": "number",
-                            "description": "The fill's spacing factor in the X direction (Vector fills)."
-                        },
-                        "verticalSpacing": {
-                            "type": "number",
-                            "description": "The fill's spacing factor in the Y direction (Vector fills)."
-                        },
-                        "angle": {
-                            "type": "number",
-                            "description": "The angle of the fill in radians (Vector, Symbol, and gradient fills)."
-                        },
-                        "bitPattern": {
-                            "type": "string",
-                            "description": "16 hex characters (8 bytes) describing the fill's bitmap pattern, one line of the pattern per byte, matching the Pattern field of the Attribute Manager XML export."
-                        },
-                        "gradientStart": {
-                            "description": "Gradient start point (LinearGradient/RadialGradient fills only).",
-                            "$ref": "#/Coordinate2D"
-                        },
-                        "gradientEnd": {
-                            "description": "Gradient end point (LinearGradient/RadialGradient fills only).",
-                            "$ref": "#/Coordinate2D"
-                        },
-                        "percent": {
-                            "type": "number",
-                            "description": "Translucency percentage [0..1] (gradient and some Solid fills)."
-                        },
-                        "texture": {
-                            "description": "Texture parameters (Image and gradient fills). Only name, rotationAngle, xSize, ySize, mirrorX, and mirrorY are used for Fills.",
-                            "$ref": "#/Texture"
-                        },
-                        "lineItems": {
-                            "type": "array",
-                            "description": "Vectorial fill line items (Vector fills only).",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "frequency": {
-                                        "type": "number",
-                                        "description": "The distance between two instances of this item."
-                                    },
-                                    "direction": {
-                                        "type": "number",
-                                        "description": "The angle of the item, measured CCW from the horizontal axis, in radians."
-                                    },
-                                    "offsetLine": {
-                                        "type": "number",
-                                        "description": "The parallel offset of the item, measured from the (rotated) horizontal axis."
-                                    },
-                                    "offset": {
-                                        "description": "The offset of the item, given by its coordinates.",
-                                        "$ref": "#/Coordinate2D"
-                                    },
-                                    "lineLengths": {
-                                        "type": "array",
-                                        "description": "Dash-gap length pairs describing this line item. Must contain an even number of items.",
-                                        "items": {
-                                            "type": "number"
-                                        }
-                                    }
-                                },
-                                "additionalProperties": false,
-                                "required": ["frequency", "direction", "offsetLine", "offset"]
-                            }
-                        },
-                        "symbolLines": {
-                            "type": "array",
-                            "description": "Line items of the fill's repeating symbol pattern (Symbol fills only).",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "begin": { "$ref": "#/Coordinate2D" },
-                                    "end": { "$ref": "#/Coordinate2D" }
-                                },
-                                "additionalProperties": false,
-                                "required": ["begin", "end"]
-                            }
-                        },
-                        "symbolArcs": {
-                            "type": "array",
-                            "description": "Arc items of the fill's repeating symbol pattern (Symbol fills only).",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "begin": { "$ref": "#/Coordinate2D" },
-                                    "origin": { "$ref": "#/Coordinate2D" },
-                                    "angle": {
-                                        "type": "number",
-                                        "description": "Arc angle in radians, measured CCW."
-                                    }
-                                },
-                                "additionalProperties": false,
-                                "required": ["begin", "origin", "angle"]
-                            }
-                        },
-                        "symbolHotspots": {
-                            "type": "array",
-                            "description": "Hotspot coordinates of the fill's repeating symbol pattern (Symbol fills only).",
-                            "items": {
-                                "$ref": "#/Coordinate2D"
-                            }
-                        }
+    "type": "object",
+    "properties": {
+        "fillDataArray": {
+            "type": "array",
+            "description": "Array of data to create new Fills.",
+            "items": {
+                "type": "object",
+                "description": "Data to create a Fill.",
+                "properties": {
+                    "attributeId": {
+                        "description": "Existing fill identity for Overwrite or ReuseIfMatching. Specify only one identity selector.",
+                        "$ref": "#/AttributeId"
                     },
-                    "additionalProperties": false,
-                    "required" : [
-                        "name"
-                    ]
-                }
+                    "index": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Existing fill identity for Overwrite or ReuseIfMatching. Specify only one identity selector."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name. If overwriteExisting is true, then the existing Fill with the given name will be overwritten."
+                    },
+                    "subType": {
+                        "type": "string",
+                        "description": "Vector, Solid, Empty, Symbol, LinearGradient, RadialGradient, or Image. Defaults to Vector. Only one Solid and one Empty fill may exist. Image fills use the texture field's name to reference the image library part.",
+                        "enum": [
+                            "Vector",
+                            "Solid",
+                            "Empty",
+                            "Symbol",
+                            "LinearGradient",
+                            "RadialGradient",
+                            "Image"
+                        ]
+                    },
+                    "scaleWithPlan": {
+                        "type": "boolean",
+                        "description": "The fill is scale dependent."
+                    },
+                    "useForWalls": {
+                        "type": "boolean",
+                        "description": "This fill can be used for cut fills."
+                    },
+                    "useForDraft": {
+                        "type": "boolean",
+                        "description": "This fill can be used for drafting fills."
+                    },
+                    "useForCover": {
+                        "type": "boolean",
+                        "description": "This fill can be used for cover fills."
+                    },
+                    "horizontalSpacing": {
+                        "type": "number",
+                        "description": "The fill's spacing factor in the X direction (Vector fills)."
+                    },
+                    "verticalSpacing": {
+                        "type": "number",
+                        "description": "The fill's spacing factor in the Y direction (Vector fills)."
+                    },
+                    "angle": {
+                        "type": "number",
+                        "description": "The angle of the fill in radians (Vector, Symbol, and gradient fills)."
+                    },
+                    "bitPattern": {
+                        "type": "string",
+                        "description": "16 hex characters (8 bytes) describing the fill's bitmap pattern, one line of the pattern per byte, matching the Pattern field of the Attribute Manager XML export.",
+                        "pattern": "^[0-9A-Fa-f]{16}$"
+                    },
+                    "gradientStart": {
+                        "description": "Gradient start point (LinearGradient/RadialGradient fills only).",
+                        "$ref": "#/Coordinate2D"
+                    },
+                    "gradientEnd": {
+                        "description": "Gradient end point (LinearGradient/RadialGradient fills only).",
+                        "$ref": "#/Coordinate2D"
+                    },
+                    "percent": {
+                        "type": "number",
+                        "description": "Translucency percentage [0..1] (gradient and some Solid fills).",
+                        "minimum": 0,
+                        "maximum": 1
+                    },
+                    "texture": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "The filename of the texture in the library (without extension)."
+                            },
+                            "rotationAngle": {
+                                "type": "number",
+                                "description": "Rotation angle in radians."
+                            },
+                            "xSize": {
+                                "type": "number",
+                                "description": "X size of the picture in model space, by default 1."
+                            },
+                            "ySize": {
+                                "type": "number",
+                                "description": "Y size of the picture in model space, by default 1."
+                            },
+                            "mirrorX": {
+                                "type": "boolean",
+                                "description": "True, if the texture is mirrored in X direction."
+                            },
+                            "mirrorY": {
+                                "type": "boolean",
+                                "description": "True, if the texture is mirrored in Y direction."
+                            }
+                        },
+                        "additionalProperties": false,
+                        "description": "Fill texture settings; other surface-only texture options are rejected."
+                    },
+                    "lineItems": {
+                        "type": "array",
+                        "description": "Vectorial fill line items (Vector fills only).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "frequency": {
+                                    "type": "number",
+                                    "description": "The distance between two instances of this item."
+                                },
+                                "direction": {
+                                    "type": "number",
+                                    "description": "The angle of the item, measured CCW from the horizontal axis, in radians."
+                                },
+                                "offsetLine": {
+                                    "type": "number",
+                                    "description": "The parallel offset of the item, measured from the (rotated) horizontal axis."
+                                },
+                                "offset": {
+                                    "description": "The offset of the item, given by its coordinates.",
+                                    "$ref": "#/Coordinate2D"
+                                },
+                                "lineLengths": {
+                                    "type": "array",
+                                    "description": "Dash-gap length pairs describing this line item. Must contain an even number of items.",
+                                    "items": {
+                                        "type": "number"
+                                    },
+                                    "maxItems": 32766
+                                }
+                            },
+                            "additionalProperties": false,
+                            "required": [
+                                "frequency",
+                                "direction",
+                                "offsetLine",
+                                "offset"
+                            ]
+                        },
+                        "maxItems": 10000
+                    },
+                    "symbolLines": {
+                        "type": "array",
+                        "description": "Line items of the fill's repeating symbol pattern (Symbol fills only).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "begin": {
+                                    "$ref": "#/Coordinate2D"
+                                },
+                                "end": {
+                                    "$ref": "#/Coordinate2D"
+                                }
+                            },
+                            "additionalProperties": false,
+                            "required": [
+                                "begin",
+                                "end"
+                            ]
+                        },
+                        "maxItems": 10000
+                    },
+                    "symbolArcs": {
+                        "type": "array",
+                        "description": "Arc items of the fill's repeating symbol pattern (Symbol fills only).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "begin": {
+                                    "$ref": "#/Coordinate2D"
+                                },
+                                "origin": {
+                                    "$ref": "#/Coordinate2D"
+                                },
+                                "angle": {
+                                    "type": "number",
+                                    "description": "Arc angle in radians, measured CCW."
+                                }
+                            },
+                            "additionalProperties": false,
+                            "required": [
+                                "begin",
+                                "origin",
+                                "angle"
+                            ]
+                        },
+                        "maxItems": 10000
+                    },
+                    "symbolHotspots": {
+                        "type": "array",
+                        "description": "Hotspot coordinates of the fill's repeating symbol pattern (Symbol fills only).",
+                        "items": {
+                            "$ref": "#/Coordinate2D"
+                        },
+                        "maxItems": 10000
+                    }
+                },
+                "additionalProperties": false,
+                "required": [
+                    "name"
+                ]
             },
-            "overwriteExisting": {
-                "type": "boolean",
-                "description": "Overwrite the Fill if exists with the same name, or if index is given with the same index. The default is false."
-            }
+            "minItems": 1,
+            "maxItems": 1000
         },
-        "additionalProperties": false,
+        "overwriteExisting": {
+            "type": "boolean",
+            "description": "Overwrite the Fill if exists with the same name, or if index is given with the same index. The default is false."
+        },
+        "ifExists": {
+            "type": "string",
+            "enum": [
+                "Error",
+                "Overwrite",
+                "ReuseIfMatching"
+            ],
+            "description": "Mutually exclusive with overwriteExisting. ReuseIfMatching compares the name, flags and complete resulting native fill pattern before reusing an existing identity without writing. Missing named fills are created. Numeric tolerance is 1e-9. Unmentioned settings are retained."
+        }
+    },
+    "additionalProperties": false,
+    "required": [
+        "fillDataArray"
+    ],
+    "not": {
         "required": [
-            "fillDataArray"
+            "ifExists",
+            "overwriteExisting"
         ]
-    })";
+    }
+})";
 }
 
 GS::Optional<GS::UniString> CreateFillsCommand::GetRawResponseSchema () const
@@ -3651,9 +4035,17 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
 {
     GS::Array<GS::ObjectState> fillDataArray;
     parameters.Get ("fillDataArray", fillDataArray);
+    if (fillDataArray.IsEmpty () || fillDataArray.GetSize ()>1000) return CreateErrorResponse (APIERR_BADPARS,"Supply 1..1000 fills.");
 
     bool overwriteExisting = false;
     parameters.Get ("overwriteExisting", overwriteExisting);
+    GS::UniString policy=overwriteExisting ? "Overwrite" : "Error";
+    if (parameters.Contains ("ifExists")) {
+        if (parameters.Contains ("overwriteExisting") || !parameters.Get ("ifExists",policy) ||
+            (policy!="Error" && policy!="Overwrite" && policy!="ReuseIfMatching")) return CreateErrorResponse (APIERR_BADPARS,"Supply one valid fill collision policy.");
+        overwriteExisting=policy=="Overwrite";
+    }
+    const bool reuseMatching=policy=="ReuseIfMatching";
 
     GS::ObjectState response;
     const auto& attributeIds = response.AddList<GS::ObjectState> ("attributeIds");
@@ -3661,6 +4053,7 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
     for (const GS::ObjectState& data : fillDataArray) {
         API_Attribute fill = {};
         API_AttributeDefExt fillDefs = {};
+        const GS::OnExit disposeFill ([&] { ACAPI_DisposeAttrDefsHdlsExt (&fillDefs); });
         fill.header.typeID = API_FilltypeID;
 
         GS::UniString name;
@@ -3668,7 +4061,7 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
             fill.header.uniStringNamePtr = &name;
         }
 
-        if (overwriteExisting) {
+        if (overwriteExisting || reuseMatching) {
             fill.header.guid = GetGuidFromAttributesArrayItem (data);
 
             Int32 index = -1;
@@ -3677,11 +4070,19 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
             }
         }
 
-        bool doesExist = (ACAPI_Attribute_Get (&fill) == NoError);
-        if (doesExist && !overwriteExisting) {
+        bool doesExist=false;
+        const GSErrCode lookupError=FindAttributeForWrite (data,overwriteExisting || reuseMatching,fill,doesExist);
+        if (lookupError!=NoError) {
+            attributeIds (CreateErrorResponse (lookupError,"Cannot resolve the requested resource; no new attribute created."));
+            continue;
+        }
+        if (doesExist && !overwriteExisting && !reuseMatching) {
             attributeIds (CreateErrorResponse (APIERR_ATTREXIST, "Already exists."));
             continue;
         }
+
+        const API_Attribute original=fill;
+        const GS::UniString originalName=name;
 
         // ACAPI_Attribute_Get writes the FOUND attribute's current name back through
         // uniStringNamePtr, clobbering a requested rename with the OLD name before Modify ever sees
@@ -3696,12 +4097,9 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
         // via the ACAPI_Attribute_Get call above filling in fill.filltype. Below, each geometry kind's own
         // "if (data.Get (...))" block overwrites the corresponding seeded handle with a freshly allocated one
         // when the caller does supply that geometry, exactly like CreateProfiles' profile_vectorImageItems.
-        API_AttributeDefExt existingDefs = {};
         if (doesExist) {
-            ACAPI_Attribute_GetDefExt (API_FilltypeID, fill.header.index, &existingDefs);
-            fillDefs.fill_lineItems = existingDefs.fill_lineItems;
-            fillDefs.fill_lineLength = existingDefs.fill_lineLength;
-            fillDefs.sfill_Items = existingDefs.sfill_Items;
+            const auto readError=ACAPI_Attribute_GetDefExt (API_FilltypeID,fill.header.index,&fillDefs);
+            if (readError!=NoError) { attributeIds (CreateErrorResponse (readError,"Cannot preserve the existing fill pattern.")); continue; }
         }
 
         // Only touch filltype.subType if subType was actually supplied, so an overwriteExisting call that omits
@@ -3721,9 +4119,37 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
                 fill.filltype.subType = APIFill_RadialGradient;
             else if (subType == "Image")
                 fill.filltype.subType = APIFill_Image;
-            else
+            else if (subType=="Vector")
                 fill.filltype.subType = APIFill_Vector;
+            else { attributeIds (CreateErrorResponse (APIERR_BADPARS,"Unknown fill subtype.")); continue; }
         }
+
+        const auto targetType=fill.filltype.subType;
+        if ((data.Contains("lineItems") && targetType!=APIFill_Vector) ||
+            ((data.Contains("symbolLines") || data.Contains("symbolArcs") || data.Contains("symbolHotspots")) && targetType!=APIFill_Symbol)) {
+            attributeIds (CreateErrorResponse (APIERR_BADPARS,"Pattern fields do not apply to this fill subtype.")); continue;
+        }
+        if (doesExist && targetType!=original.filltype.subType) {
+            ACAPI_DisposeAttrDefsHdlsExt (&fillDefs); fillDefs={};
+            fill.filltype.linNumb=0; fill.filltype.arcNumb=0; fill.filltype.hotNumb=0; fill.filltype.filNumb=0;
+        }
+        bool bounded=true; UInt32 totalLengths=0;
+        for (const auto key:{"lineItems","symbolLines","symbolArcs","symbolHotspots"}) {
+            GS::Array<GS::ObjectState> values;
+            if (data.Get(key,values) && values.GetSize()>10000) bounded=false;
+            if (GS::UniString(key)=="lineItems") for (const auto& value:values) {
+                GS::Array<double> lengths; value.Get("lineLengths",lengths);
+                if (lengths.GetSize()>32766 || lengths.GetSize()%2!=0 || totalLengths+lengths.GetSize()>1000000) { bounded=false; break; }
+                totalLengths+=lengths.GetSize();
+                for (double length:lengths) if (!std::isfinite(length) || length<0) bounded=false;
+            }
+        }
+        GS::UniString requestedPattern;
+        if (data.Get("bitPattern",requestedPattern)) {
+            const std::string pattern(requestedPattern.ToCStr(CC_UTF8).Get());
+            if (pattern.size()!=16 || pattern.find_first_not_of("0123456789abcdefABCDEF")!=std::string::npos) bounded=false;
+        }
+        if (!bounded) { attributeIds (CreateErrorResponse (APIERR_BADPARS,"Invalid or oversized fill pattern. Dash-gap arrays must have an even length.")); continue; }
 
         bool scaleWithPlan;
         if (data.Get ("scaleWithPlan", scaleWithPlan)) {
@@ -3776,6 +4202,11 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
 
         GS::ObjectState textureObj;
         if (data.Get ("texture", textureObj)) {
+            GS::UniString textureName;
+            if (textureObj.Get("name",textureName) && (textureName.IsEmpty() || textureName.GetLength()>=API_UniLongNameLen)) {
+                attributeIds (CreateErrorResponse (APIERR_BADPARS,"Texture filename is empty or exceeds the native limit.")); continue;
+            }
+            if (!doesExist) { fill.filltype.textureXSize=1.0; fill.filltype.textureYSize=1.0; }
             SetUCharProperty (&textureObj, "name", fill.filltype.textureName);
 
             double rotationAngle;
@@ -3806,18 +4237,28 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
             }
         }
 
+        const auto& configured=fill.filltype;
+        if (!std::isfinite(configured.hXSpac) || !std::isfinite(configured.hYSpac) || !std::isfinite(configured.hAngle) || !std::isfinite(configured.percent) ||
+            configured.percent<0 || configured.percent>1 || !std::isfinite(configured.c1.x) || !std::isfinite(configured.c1.y) || !std::isfinite(configured.c2.x) || !std::isfinite(configured.c2.y) ||
+            (data.Contains("texture") && (!std::isfinite(configured.textureRotAng) || !std::isfinite(configured.textureXSize) || !std::isfinite(configured.textureYSize) || configured.textureXSize<=0 || configured.textureYSize<=0))) {
+            attributeIds (CreateErrorResponse (APIERR_BADPARS,"Invalid fill numeric setting or texture size.")); continue;
+        }
+
         // Only touch linNumb/fill_lineItems if lineItems was actually supplied, so an overwriteExisting call that
         // only changes e.g. the angle doesn't wipe out the existing vector fill's line pattern (linNumb would
         // otherwise drop to 0).
         GS::Array<GS::ObjectState> lineItems;
         if (data.Get ("lineItems", lineItems)) {
             UInt32 nItems = lineItems.GetSize ();
+            BMKillHandle (reinterpret_cast<GSHandle*> (&fillDefs.fill_lineItems));
+            BMKillHandle (reinterpret_cast<GSHandle*> (&fillDefs.fill_lineLength));
             fill.filltype.linNumb = (Int32) nItems;
 
             if (nItems > 0) {
                 fillDefs.fill_lineItems = (API_FillLine**) BMAllocateHandle (nItems * sizeof (API_FillLine), ALLOCATE_CLEAR, 0);
+                if (fillDefs.fill_lineItems==nullptr) { attributeIds (CreateErrorResponse (APIERR_MEMFULL,"Cannot allocate fill geometry.")); continue; }
 
-                UInt32 totalLengths = 0;
+                totalLengths = 0;
                 for (const GS::ObjectState& itemData : lineItems) {
                     GS::Array<double> lineLengths;
                     itemData.Get ("lineLengths", lineLengths);
@@ -3825,6 +4266,7 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
                 }
                 if (totalLengths > 0) {
                     fillDefs.fill_lineLength = (double**) BMAllocateHandle (totalLengths * sizeof (double), ALLOCATE_CLEAR, 0);
+                    if (fillDefs.fill_lineLength==nullptr) { attributeIds (CreateErrorResponse (APIERR_MEMFULL,"Cannot allocate fill geometry.")); continue; }
                 }
 
                 Int32 lengthOffset = 0;
@@ -3858,10 +4300,12 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
         GS::Array<GS::ObjectState> symbolLines;
         if (data.Get ("symbolLines", symbolLines)) {
             UInt32 nItems = symbolLines.GetSize ();
+            BMKillHandle (reinterpret_cast<GSHandle*> (&fillDefs.sfill_Items.sfill_Lines));
             fill.filltype.linNumb = (Int32) nItems;
 
             if (nItems > 0) {
                 fillDefs.sfill_Items.sfill_Lines = (API_SFill_Line**) BMAllocateHandle (nItems * sizeof (API_SFill_Line), ALLOCATE_CLEAR, 0);
+                if (fillDefs.sfill_Items.sfill_Lines==nullptr) { attributeIds (CreateErrorResponse (APIERR_MEMFULL,"Cannot allocate fill geometry.")); continue; }
                 for (UInt32 i = 0; i < nItems; ++i) {
                     API_SFill_Line& item = (*fillDefs.sfill_Items.sfill_Lines)[i];
                     if (const GS::ObjectState* begin = symbolLines[i].Get ("begin")) {
@@ -3877,10 +4321,12 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
         GS::Array<GS::ObjectState> symbolArcs;
         if (data.Get ("symbolArcs", symbolArcs)) {
             UInt32 nItems = symbolArcs.GetSize ();
+            BMKillHandle (reinterpret_cast<GSHandle*> (&fillDefs.sfill_Items.sfill_Arcs));
             fill.filltype.arcNumb = (Int32) nItems;
 
             if (nItems > 0) {
                 fillDefs.sfill_Items.sfill_Arcs = (API_SFill_Arc**) BMAllocateHandle (nItems * sizeof (API_SFill_Arc), ALLOCATE_CLEAR, 0);
+                if (fillDefs.sfill_Items.sfill_Arcs==nullptr) { attributeIds (CreateErrorResponse (APIERR_MEMFULL,"Cannot allocate fill geometry.")); continue; }
                 for (UInt32 i = 0; i < nItems; ++i) {
                     API_SFill_Arc& item = (*fillDefs.sfill_Items.sfill_Arcs)[i];
                     if (const GS::ObjectState* begin = symbolArcs[i].Get ("begin")) {
@@ -3897,34 +4343,68 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
         GS::Array<GS::ObjectState> symbolHotspots;
         if (data.Get ("symbolHotspots", symbolHotspots)) {
             UInt32 nItems = symbolHotspots.GetSize ();
+            BMKillHandle (reinterpret_cast<GSHandle*> (&fillDefs.sfill_Items.sfill_HotSpots));
             fill.filltype.hotNumb = (Int32) nItems;
 
             if (nItems > 0) {
                 fillDefs.sfill_Items.sfill_HotSpots = (API_Coord**) BMAllocateHandle (nItems * sizeof (API_Coord), ALLOCATE_CLEAR, 0);
+                if (fillDefs.sfill_Items.sfill_HotSpots==nullptr) { attributeIds (CreateErrorResponse (APIERR_MEMFULL,"Cannot allocate fill geometry.")); continue; }
                 for (UInt32 i = 0; i < nItems; ++i) {
                     (*fillDefs.sfill_Items.sfill_HotSpots)[i] = Get2DCoordinateFromObjectState (symbolHotspots[i]);
                 }
             }
         }
 
+        if (doesExist && reuseMatching) {
+            API_AttributeDefExt previous={};
+            const GS::OnExit disposePrevious ([&] { ACAPI_DisposeAttrDefsHdlsExt (&previous); });
+            const auto err=ACAPI_Attribute_GetDefExt (API_FilltypeID,original.header.index,&previous);
+            if (err!=NoError) { attributeIds (CreateErrorResponse (err,"Cannot compare the existing fill pattern.")); continue; }
+            const auto number=[] (double x,double y) { return std::isfinite(x) && std::isfinite(y) && std::abs(x-y)<=1e-9; };
+            const auto coord=[&] (const API_Coord& x,const API_Coord& y) { return number(x.x,y.x) && number(x.y,y.y); };
+            const auto array=[] (auto x,auto y,auto equal) {
+                if (x==nullptr || y==nullptr) return x==nullptr && y==nullptr;
+                const auto nx=BMhGetSize(reinterpret_cast<GSHandle>(x)),ny=BMhGetSize(reinterpret_cast<GSHandle>(y));
+                if (nx!=ny || nx<0 || nx%sizeof(**x)!=0 || nx>64*1024*1024) return false;
+                const auto count=static_cast<size_t>(nx)/sizeof(**x);
+                for (size_t i=0;i<count;++i) if (!equal((*x)[i],(*y)[i])) return false;
+                return true;
+            };
+            const auto& a=original.filltype; const auto& b=fill.filltype;
+            bool matches=originalName==name && original.header.flags==fill.header.flags && a.subType==b.subType &&
+                std::memcmp(a.bitPat,b.bitPat,sizeof(a.bitPat))==0 && number(a.hXSpac,b.hXSpac) && number(a.hYSpac,b.hYSpac) && number(a.hAngle,b.hAngle) &&
+                a.linNumb==b.linNumb && a.arcNumb==b.arcNumb && a.hotNumb==b.hotNumb && a.filNumb==b.filNumb && coord(a.c1,b.c1) && coord(a.c2,b.c2) &&
+                GS::UniString(a.textureName)==GS::UniString(b.textureName) && a.textureStatus==b.textureStatus && number(a.textureXSize,b.textureXSize) &&
+                number(a.textureYSize,b.textureYSize) && number(a.textureRotAng,b.textureRotAng) && number(a.percent,b.percent);
+            matches=matches && array(previous.fill_lineItems,fillDefs.fill_lineItems,[&] (const API_FillLine& x,const API_FillLine& y) {
+                return number(x.lFreq,y.lFreq) && number(x.lDir,y.lDir) && number(x.lOffsetLine,y.lOffsetLine) && coord(x.lOffset,y.lOffset) && x.lPartNumb==y.lPartNumb && x.lPartOffs==y.lPartOffs;
+            }) && array(previous.fill_lineLength,fillDefs.fill_lineLength,number);
+            const auto& x=previous.sfill_Items; const auto& y=fillDefs.sfill_Items;
+            matches=matches && array(x.sfill_HotSpots,y.sfill_HotSpots,coord) && array(x.sfill_FillCoords,y.sfill_FillCoords,coord) &&
+                array(x.sfill_Lines,y.sfill_Lines,[&] (const API_SFill_Line& u,const API_SFill_Line& v) { return coord(u.begC,v.begC) && coord(u.endC,v.endC); }) &&
+                array(x.sfill_Arcs,y.sfill_Arcs,[&] (const API_SFill_Arc& u,const API_SFill_Arc& v) { return coord(u.begC,v.begC) && coord(u.origC,v.origC) && number(u.angle,v.angle); }) &&
+                array(x.sfill_SolidFills,y.sfill_SolidFills,[] (const API_Polygon& u,const API_Polygon& v) { return u.nCoords==v.nCoords && u.nSubPolys==v.nSubPolys && u.nArcs==v.nArcs; }) &&
+                array(x.sfill_SubPolys,y.sfill_SubPolys,[] (Int32 u,Int32 v) { return u==v; }) &&
+                array(x.sfill_PolyArcs,y.sfill_PolyArcs,[&] (const API_PolyArc& u,const API_PolyArc& v) { return u.begIndex==v.begIndex && u.endIndex==v.endIndex && number(u.arcAngle,v.arcAngle); });
+            if (!matches) { attributeIds (CreateErrorResponse (APIERR_ATTREXIST,"Existing fill differs; ReuseIfMatching makes no changes.")); continue; }
+            attributeIds (CreateAttributeIdObjectState (fill.header.guid)); continue;
+        }
+
         if (doesExist) {
             GSErrCode err = ACAPI_Attribute_ModifyExt (&fill, &fillDefs);
             if (err != NoError) {
                 attributeIds (CreateErrorResponse (err, "Failed to modify."));
-                ACAPI_DisposeAttrDefsHdlsExt (&fillDefs);
                 continue;
             }
         } else {
             GSErrCode err = ACAPI_Attribute_CreateExt (&fill, &fillDefs);
             if (err != NoError) {
                 attributeIds (CreateErrorResponse (err, "Failed to create."));
-                ACAPI_DisposeAttrDefsHdlsExt (&fillDefs);
                 continue;
             }
         }
 
         attributeIds (CreateAttributeIdObjectState (fill.header.guid));
-        ACAPI_DisposeAttrDefsHdlsExt (&fillDefs);
     }
 
     return response;
@@ -3952,7 +4432,7 @@ GS::Optional<GS::UniString> CreateZoneCategoriesCommand::GetInputParametersSchem
                             "$ref": "#/AttributeId"
                         },
                         "index": {
-                            "type": "string",
+                            "type": "integer", "minimum": 1,
                             "description": "Index of the existing Zone Category to overwrite, ignored if overwriteExisting is false."
                         },
                         "name": {
@@ -3997,7 +4477,7 @@ GS::Optional<GS::UniString> CreateZoneCategoriesCommand::GetInputParametersSchem
     })";
 }
 
-void CreateZoneCategoriesCommand::SetTypeSpecificParameters (const GS::ObjectState& parameters, API_Attribute& attribute, API_AttributeDef& attributeDef) const
+GSErrCode CreateZoneCategoriesCommand::SetTypeSpecificParameters (const GS::ObjectState& parameters, API_Attribute& attribute, API_AttributeDef& attributeDef) const
 {
     // ACAPI_Attribute_Create/Modify requires zone_addParItems (the zone stamp's GDL parameters) to be filled in
     // for API_ZoneCatID, otherwise it fails with APIERR_BADPARS. We always seed the stamp reference and its
@@ -4031,6 +4511,7 @@ void CreateZoneCategoriesCommand::SetTypeSpecificParameters (const GS::ObjectSta
 
     SetUCharProperty (&parameters, "categoryCode", attribute.zoneCat.catCode);
     GetColor (parameters, "color", attribute.zoneCat.rgb);
+    return NoError;
 }
 
 CreateMEPSystemsCommand::CreateMEPSystemsCommand () :
@@ -4055,7 +4536,7 @@ GS::Optional<GS::UniString> CreateMEPSystemsCommand::GetInputParametersSchema ()
                             "$ref": "#/AttributeId"
                         },
                         "index": {
-                            "type": "string",
+                            "type": "integer", "minimum": 1,
                             "description": "Index of the existing MEP System to overwrite, ignored if overwriteExisting is false."
                         },
                         "name": {
@@ -4109,7 +4590,7 @@ GS::Optional<GS::UniString> CreateMEPSystemsCommand::GetInputParametersSchema ()
     })";
 }
 
-void CreateMEPSystemsCommand::SetTypeSpecificParameters (const GS::ObjectState& parameters, API_Attribute& attribute, API_AttributeDef&) const
+GSErrCode CreateMEPSystemsCommand::SetTypeSpecificParameters (const GS::ObjectState& parameters, API_Attribute& attribute, API_AttributeDef&) const
 {
     GS::UniString domain;
     if (parameters.Get ("domain", domain)) {
@@ -4153,6 +4634,7 @@ void CreateMEPSystemsCommand::SetTypeSpecificParameters (const GS::ObjectState& 
             attribute.mepSystem.centerLTypeInd = lineTypeIndex;
         }
     }
+    return NoError;
 }
 
 CreateSurfacesCommand::CreateSurfacesCommand () :
@@ -4163,93 +4645,130 @@ CreateSurfacesCommand::CreateSurfacesCommand () :
 GS::Optional<GS::UniString> CreateSurfacesCommand::GetInputParametersSchema () const
 {
     return R"({
-        "type": "object",
-        "properties": {
-            "surfaceDataArray": {
-                "type": "array",
-                "description" : "Array of data to create new surfaces.",
-                "items": {
-                    "type": "object",
-                    "description": "Data to create a surface.",
-                    "properties": {
-                        "attributeId": {
-                            "description": "Indentifier of the existing Surface to overwrite, ignored if overwriteExisting is false.",
-                            "$ref": "#/AttributeId"
-                        },
-                        "index": {
-                            "type": "string",
-                            "description": "Index of the existing surface to overwrite, ignored if overwriteExisting is false."
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "Name. If overwriteExisting is true, then the existing surface with the given name will be overwritten."
-                        },
-                        "materialType": {
-                            "$ref": "#/SurfaceType"
-                        },
-                        "ambientReflection": {
-                            "type": "number",
-                            "description": "Ambient percentage [0..100]."
-                        },
-                        "diffuseReflection": {
-                            "type": "number",
-                            "description": "Diffuse percentage [0..100]."
-                        },
-                        "specularReflection": {
-                            "type": "number",
-                            "description": "Specular percentage [0..100]."
-                        },
-                        "transparency": {
-                            "type": "number",
-                            "description": "Transparency percentage [0..100]."
-                        },
-                        "shine": {
-                            "type": "number",
-                            "description": "The shininess factor multiplied by 100 [0..10000]."
-                        },
-                        "transparencyAttenuation": {
-                            "type": "number",
-                            "description": "Transparency attenuation multiplied by 100 [0..10000]."
-                        },
-                        "emissionAttenuation": {
-                            "type": "number",
-                            "description": "Emission attenuation multiplied by 100 [0..10000]."
-                        },
-                        "surfaceColor": {
-                            "$ref": "#/ColorRGB"
-                        },
-                        "specularColor": {
-                            "$ref": "#/ColorRGB"
-                        },
-                        "emissionColor": {
-                            "$ref": "#/ColorRGB"
-                        },
-                        "fillId": {
-                            "$ref": "#/AttributeIdArrayItem"
-                        },
-                        "texture": {
-                            "$ref": "#/Texture"
-                        }
+    "type": "object",
+    "properties": {
+        "surfaceDataArray": {
+            "type": "array",
+            "description": "Array of data to create new surfaces.",
+            "items": {
+                "type": "object",
+                "description": "Data to create a surface.",
+                "properties": {
+                    "attributeId": {
+                        "description": "Existing surface identity for Overwrite or ReuseIfMatching. Specify only one identity selector.",
+                        "$ref": "#/AttributeId"
                     },
-                    "additionalProperties": false,
-                    "required" : [
-                        "name"
-                    ]
-                }
-            },
-            "overwriteExisting": {
-                "type": "boolean",
-                "description": "Overwrite the Surface if exists with the same name, or if index is given with the same index. The default is false."
+                    "index": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Existing surface identity for Overwrite or ReuseIfMatching. Specify only one identity selector."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name. If overwriteExisting is true, then the existing surface with the given name will be overwritten."
+                    },
+                    "materialType": {
+                        "$ref": "#/SurfaceType"
+                    },
+                    "ambientReflection": {
+                        "type": "number",
+                        "description": "Whole native value in the range 0..100; fractions are rejected.",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "multipleOf": 1
+                    },
+                    "diffuseReflection": {
+                        "type": "number",
+                        "description": "Whole native value in the range 0..100; fractions are rejected.",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "multipleOf": 1
+                    },
+                    "specularReflection": {
+                        "type": "number",
+                        "description": "Whole native value in the range 0..100; fractions are rejected.",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "multipleOf": 1
+                    },
+                    "transparency": {
+                        "type": "number",
+                        "description": "Whole native value in the range 0..100; fractions are rejected.",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "multipleOf": 1
+                    },
+                    "shine": {
+                        "type": "number",
+                        "description": "Whole native value in the range 0..10000; fractions are rejected.",
+                        "minimum": 0,
+                        "maximum": 10000,
+                        "multipleOf": 1
+                    },
+                    "transparencyAttenuation": {
+                        "type": "number",
+                        "description": "Whole native value in the range 0..400; fractions are rejected.",
+                        "minimum": 0,
+                        "maximum": 400,
+                        "multipleOf": 1
+                    },
+                    "emissionAttenuation": {
+                        "type": "number",
+                        "description": "Whole native value in the range 0..10000; fractions are rejected.",
+                        "minimum": 0,
+                        "maximum": 10000,
+                        "multipleOf": 1
+                    },
+                    "surfaceColor": {
+                        "$ref": "#/ColorRGB"
+                    },
+                    "specularColor": {
+                        "$ref": "#/ColorRGB"
+                    },
+                    "emissionColor": {
+                        "$ref": "#/ColorRGB"
+                    },
+                    "fillId": {
+                        "$ref": "#/AttributeIdArrayItem"
+                    },
+                    "texture": {
+                        "$ref": "#/Texture"
+                    }
+                },
+                "additionalProperties": false,
+                "required": [
+                    "name"
+                ]
             }
         },
-        "additionalProperties": false,
+        "overwriteExisting": {
+            "type": "boolean",
+            "description": "Overwrite the Surface if exists with the same name, or if index is given with the same index. The default is false."
+        },
+        "ifExists": {
+            "type": "string",
+            "enum": [
+                "Error",
+                "Overwrite",
+                "ReuseIfMatching"
+            ],
+            "description": "Mutually exclusive with overwriteExisting. ReuseIfMatching creates a missing named surface or returns the existing identity when name and supplied surface settings match. Unmentioned settings are retained. Numeric comparison tolerance is 1e-9. Rendering-engine settings not exposed by this command are not compared or authored."
+        }
+    },
+    "additionalProperties": false,
+    "required": [
+        "surfaceDataArray"
+    ],
+    "not": {
         "required": [
-            "surfaceDataArray"
+            "ifExists",
+            "overwriteExisting"
         ]
-    })";
+    }
+})";
 }
 
-void CreateSurfacesCommand::SetTypeSpecificParameters (const GS::ObjectState& parameters, API_Attribute& attribute, API_AttributeDef&) const
+GSErrCode CreateSurfacesCommand::SetTypeSpecificParameters (const GS::ObjectState& parameters, API_Attribute& attribute, API_AttributeDef&) const
 {
     GS::UniString typeStr;
     if (parameters.Get ("materialType", typeStr)) {
@@ -4267,8 +4786,10 @@ void CreateSurfacesCommand::SetTypeSpecificParameters (const GS::ObjectState& pa
             attribute.material.mtype = APIMater_ConstID;
         else if (typeStr == "Simple")
             attribute.material.mtype = APIMater_SimpleID;
-        else
+        else if (typeStr == "General")
             attribute.material.mtype = APIMater_GeneralID;
+        else
+            return APIERR_BADPARS;
     }
 
     // Extracted as double, not short, even though the underlying API_MaterialType fields are short: the JSON
@@ -4279,36 +4800,43 @@ void CreateSurfacesCommand::SetTypeSpecificParameters (const GS::ObjectState& pa
     // what was sent).
     double ambientReflection;
     if (parameters.Get ("ambientReflection", ambientReflection)) {
+        if (!std::isfinite(ambientReflection) || ambientReflection<0 || ambientReflection>100 || std::floor(ambientReflection)!=ambientReflection) return APIERR_BADPARS;
         attribute.material.ambientPc = (short) ambientReflection;
     }
 
     double diffuseReflection;
     if (parameters.Get ("diffuseReflection", diffuseReflection)) {
+        if (!std::isfinite(diffuseReflection) || diffuseReflection<0 || diffuseReflection>100 || std::floor(diffuseReflection)!=diffuseReflection) return APIERR_BADPARS;
         attribute.material.diffusePc = (short) diffuseReflection;
     }
 
     double specularReflection;
     if (parameters.Get ("specularReflection", specularReflection)) {
+        if (!std::isfinite(specularReflection) || specularReflection<0 || specularReflection>100 || std::floor(specularReflection)!=specularReflection) return APIERR_BADPARS;
         attribute.material.specularPc = (short) specularReflection;
     }
 
     double transparency;
     if (parameters.Get ("transparency", transparency)) {
+        if (!std::isfinite(transparency) || transparency<0 || transparency>100 || std::floor(transparency)!=transparency) return APIERR_BADPARS;
         attribute.material.transpPc = (short) transparency;
     }
 
     double shine;
     if (parameters.Get ("shine", shine)) {
+        if (!std::isfinite(shine) || shine<0 || shine>10000 || std::floor(shine)!=shine) return APIERR_BADPARS;
         attribute.material.shine = (short) shine;
     }
 
     double transparencyAttenuation;
     if (parameters.Get ("transparencyAttenuation", transparencyAttenuation)) {
+        if (!std::isfinite(transparencyAttenuation) || transparencyAttenuation<0 || transparencyAttenuation>400 || std::floor(transparencyAttenuation)!=transparencyAttenuation) return APIERR_BADPARS;
         attribute.material.transpAtt = (short) transparencyAttenuation;
     }
 
     double emissionAttenuation;
     if (parameters.Get ("emissionAttenuation", emissionAttenuation)) {
+        if (!std::isfinite(emissionAttenuation) || emissionAttenuation<0 || emissionAttenuation>10000 || std::floor(emissionAttenuation)!=emissionAttenuation) return APIERR_BADPARS;
         attribute.material.emissionAtt = (short) emissionAttenuation;
     }
 
@@ -4316,72 +4844,99 @@ void CreateSurfacesCommand::SetTypeSpecificParameters (const GS::ObjectState& pa
     GetColor (parameters, "specularColor", attribute.material.specularRGB);
     GetColor (parameters, "emissionColor", attribute.material.emissionRGB);
 
+    for (const auto* rgb:{&attribute.material.surfaceRGB,&attribute.material.specularRGB,&attribute.material.emissionRGB}) {
+        if (!std::isfinite(rgb->f_red) || !std::isfinite(rgb->f_green) || !std::isfinite(rgb->f_blue) ||
+            rgb->f_red<0 || rgb->f_red>1 || rgb->f_green<0 || rgb->f_green>1 || rgb->f_blue<0 || rgb->f_blue>1) return APIERR_BADPARS;
+    }
+
     GS::ObjectState fillId;
     if (parameters.Get ("fillId", fillId)) {
         API_AttributeIndex fillIndex;
-        if (GetAttributeIndexFromAttributeId (fillId, API_FilltypeID, fillIndex)) {
-            attribute.material.ifill = fillIndex;
-        }
+        if (!GetAttributeIndexFromAttributeId (fillId, API_FilltypeID, fillIndex)) return APIERR_BADID;
+        attribute.material.ifill = fillIndex;
     }
 
     GS::ObjectState textureObj;
     if (parameters.Get ("texture", textureObj)) {
         attribute.material.texture.status |= APITxtr_LinkMat;
-        SetUCharProperty(&textureObj, "name", attribute.material.texture.texName);
+        if (!IsPositiveAttributeIndex(attribute.header.index)) {
+            attribute.material.texture.xSize=1.0;
+            attribute.material.texture.ySize=1.0;
+        }
+        GS::UniString textureName;
+        if (textureObj.Get ("name",textureName)) {
+            if (textureName.IsEmpty () || textureName.GetLength ()>=API_UniLongNameLen) return APIERR_BADPARS;
+            if (textureName!=GS::UniString(attribute.material.texture.texName)) attribute.material.texture.fileLoc=nullptr;
+            SetUCharProperty (&textureObj,"name",attribute.material.texture.texName);
+        }
 
         double rotationAngle;
         if (textureObj.Get ("rotationAngle", rotationAngle)) {
+            if (!std::isfinite(rotationAngle)) return APIERR_BADPARS;
             attribute.material.texture.rotAng = rotationAngle;
         }
         double xSize;
         if (textureObj.Get ("xSize", xSize)) {
+            if (!std::isfinite(xSize) || xSize<=0) return APIERR_BADPARS;
             attribute.material.texture.xSize = xSize;
         }
         double ySize;
         if (textureObj.Get ("ySize", ySize)) {
+            if (!std::isfinite(ySize) || ySize<=0) return APIERR_BADPARS;
             attribute.material.texture.ySize = ySize;
         }
         bool fillRectangle;
-        if (textureObj.Get ("FillRectangle", fillRectangle) && fillRectangle) {
-            attribute.material.texture.status |= APITxtr_FillRectNatur;
+        if (textureObj.Get ("FillRectangle", fillRectangle)) {
+            if (fillRectangle) attribute.material.texture.status |= APITxtr_FillRectNatur;
+            else attribute.material.texture.status &= ~APITxtr_FillRectNatur;
         }
         bool fitPicture;
-        if (textureObj.Get ("FitPicture", fitPicture) && fitPicture) {
-            attribute.material.texture.status |= APITxtr_FitPictNatur;
+        if (textureObj.Get ("FitPicture", fitPicture)) {
+            if (fitPicture) attribute.material.texture.status |= APITxtr_FitPictNatur;
+            else attribute.material.texture.status &= ~APITxtr_FitPictNatur;
         }
         bool mirrorX;
-        if (textureObj.Get ("mirrorX", mirrorX) && mirrorX) {
-            attribute.material.texture.status |= APITxtr_MirrorX;
+        if (textureObj.Get ("mirrorX", mirrorX)) {
+            if (mirrorX) attribute.material.texture.status |= APITxtr_MirrorX;
+            else attribute.material.texture.status &= ~APITxtr_MirrorX;
         }
         bool mirrorY;
-        if (textureObj.Get ("mirrorY", mirrorY) && mirrorY) {
-            attribute.material.texture.status |= APITxtr_MirrorY;
+        if (textureObj.Get ("mirrorY", mirrorY)) {
+            if (mirrorY) attribute.material.texture.status |= APITxtr_MirrorY;
+            else attribute.material.texture.status &= ~APITxtr_MirrorY;
         }
         bool useAlphaChannel;
-        if (textureObj.Get ("useAlphaChannel", useAlphaChannel) && useAlphaChannel) {
-            attribute.material.texture.status |= APITxtr_UseAlpha;
+        if (textureObj.Get ("useAlphaChannel", useAlphaChannel)) {
+            if (useAlphaChannel) attribute.material.texture.status |= APITxtr_UseAlpha;
+            else attribute.material.texture.status &= ~APITxtr_UseAlpha;
         }
         bool alphaChannelChangesTransparency;
-        if (textureObj.Get ("alphaChannelChangesTransparency", alphaChannelChangesTransparency) && alphaChannelChangesTransparency) {
-            attribute.material.texture.status |= APITxtr_TransPattern;
+        if (textureObj.Get ("alphaChannelChangesTransparency", alphaChannelChangesTransparency)) {
+            if (alphaChannelChangesTransparency) attribute.material.texture.status |= APITxtr_TransPattern;
+            else attribute.material.texture.status &= ~APITxtr_TransPattern;
         }
         bool alphaChannelChangesSurfaceColor;
-        if (textureObj.Get ("alphaChannelChangesSurfaceColor", alphaChannelChangesSurfaceColor) && alphaChannelChangesSurfaceColor) {
-            attribute.material.texture.status |= APITxtr_SurfacePattern;
+        if (textureObj.Get ("alphaChannelChangesSurfaceColor", alphaChannelChangesSurfaceColor)) {
+            if (alphaChannelChangesSurfaceColor) attribute.material.texture.status |= APITxtr_SurfacePattern;
+            else attribute.material.texture.status &= ~APITxtr_SurfacePattern;
         }
         bool alphaChannelChangesAmbientColor;
-        if (textureObj.Get ("alphaChannelChangesAmbientColor", alphaChannelChangesAmbientColor) && alphaChannelChangesAmbientColor) {
-            attribute.material.texture.status |= APITxtr_AmbientPattern;
+        if (textureObj.Get ("alphaChannelChangesAmbientColor", alphaChannelChangesAmbientColor)) {
+            if (alphaChannelChangesAmbientColor) attribute.material.texture.status |= APITxtr_AmbientPattern;
+            else attribute.material.texture.status &= ~APITxtr_AmbientPattern;
         }
         bool alphaChannelChangesSpecularColor;
-        if (textureObj.Get ("alphaChannelChangesSpecularColor", alphaChannelChangesSpecularColor) && alphaChannelChangesSpecularColor) {
-            attribute.material.texture.status |= APITxtr_SpecularPattern;
+        if (textureObj.Get ("alphaChannelChangesSpecularColor", alphaChannelChangesSpecularColor)) {
+            if (alphaChannelChangesSpecularColor) attribute.material.texture.status |= APITxtr_SpecularPattern;
+            else attribute.material.texture.status &= ~APITxtr_SpecularPattern;
         }
         bool alphaChannelChangesDiffuseColor;
-        if (textureObj.Get ("alphaChannelChangesDiffuseColor", alphaChannelChangesDiffuseColor) && alphaChannelChangesDiffuseColor) {
-            attribute.material.texture.status |= APITxtr_DiffusePattern;
+        if (textureObj.Get ("alphaChannelChangesDiffuseColor", alphaChannelChangesDiffuseColor)) {
+            if (alphaChannelChangesDiffuseColor) attribute.material.texture.status |= APITxtr_DiffusePattern;
+            else attribute.material.texture.status &= ~APITxtr_DiffusePattern;
         }
     }
+    return NoError;
 }
 
 CreatePenTablesCommand::CreatePenTablesCommand () :
@@ -4397,82 +4952,106 @@ GS::String CreatePenTablesCommand::GetName () const
 GS::Optional<GS::UniString> CreatePenTablesCommand::GetInputParametersSchema () const
 {
     return R"({
-        "type": "object",
-        "properties": {
-            "penTableDataArray": {
-                "type": "array",
-                "description" : "Array of data to create new Pen Tables.",
-                "items": {
-                    "type": "object",
-                    "description": "Data to create a Pen Table.",
-                    "properties": {
-                        "attributeId": {
-                            "description": "Indentifier of the existing Pen Table to overwrite, ignored if overwriteExisting is false.",
-                            "$ref": "#/AttributeId"
-                        },
-                        "index": {
-                            "type": "string",
-                            "description": "Index of the existing Pen Table to overwrite, ignored if overwriteExisting is false."
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "Name. If overwriteExisting is true, then the existing Pen Table with the given name will be overwritten."
-                        },
-                        "isActiveForModel": {
-                            "type": "boolean",
-                            "description": "Make this the active Pen Table for the model window. Defaults to false for a new Pen Table, or to the current value when overwriting an existing one."
-                        },
-                        "isActiveForLayout": {
-                            "type": "boolean",
-                            "description": "Make this the active Pen Table for layouts. Defaults to false for a new Pen Table, or to the current value when overwriting an existing one."
-                        },
-                        "sourceAttributeId": {
-                            "description": "Identifier of the Pen Table whose 255 pens are used as the starting point, before the pens listed in the pens array are applied on top. Defaults to the Pen Table being overwritten itself (so unlisted pens keep their current color/width/description), or an arbitrary existing Pen Table in the project when creating a brand new one (or a plain black, 0.1 mm pen for all 255 if the project has no Pen Table at all yet).",
-                            "$ref": "#/AttributeIdArrayItem"
-                        },
-                        "pens": {
-                            "type": "array",
-                            "description": "The pens to set in the Pen Table, on top of the 255 pens copied from sourceAttributeId (or the current Pen Table, or an arbitrary existing one - see sourceAttributeId). Only list the pens you actually want to change.",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "index": {
-                                        "type": "integer",
-                                        "description": "Index of the pen [1..255]."
-                                    },
-                                    "color": {
-                                        "$ref": "#/ColorRGB"
-                                    },
-                                    "width": {
-                                        "type": "number",
-                                        "description": "Thickness of the pen defined in paper millimeters."
-                                    },
-                                    "description": {
-                                        "type": "string",
-                                        "description": "Textual description of the pen."
-                                    }
-                                },
-                                "additionalProperties": false,
-                                "required": ["index"]
-                            }
-                        }
+    "type": "object",
+    "properties": {
+        "penTableDataArray": {
+            "type": "array",
+            "description": "Array of data to create new Pen Tables.",
+            "items": {
+                "type": "object",
+                "description": "Data to create a Pen Table.",
+                "properties": {
+                    "attributeId": {
+                        "description": "Existing pen table identity for Overwrite or ReuseIfMatching. Specify only one identity selector.",
+                        "$ref": "#/AttributeId"
                     },
-                    "additionalProperties": false,
-                    "required" : [
-                        "name"
-                    ]
-                }
+                    "index": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Existing pen table identity for Overwrite or ReuseIfMatching. Specify only one identity selector."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name. If overwriteExisting is true, then the existing Pen Table with the given name will be overwritten."
+                    },
+                    "isActiveForModel": {
+                        "type": "boolean",
+                        "description": "Make this the active Pen Table for the model window. Defaults to false for a new Pen Table, or to the current value when overwriting an existing one. Requires Archicad 27 or newer; older versions reject this setting."
+                    },
+                    "isActiveForLayout": {
+                        "type": "boolean",
+                        "description": "Make this the active Pen Table for layouts. Defaults to false for a new Pen Table, or to the current value when overwriting an existing one. Requires Archicad 27 or newer; older versions reject this setting."
+                    },
+                    "sourceAttributeId": {
+                        "description": "Identifier of the Pen Table whose 255 pens are used as the starting point, before the pens listed in the pens array are applied on top. Defaults to the Pen Table being overwritten itself (so unlisted pens keep their current color/width/description), or an arbitrary existing Pen Table in the project when creating a brand new one (or a plain black, 0.1 mm pen for all 255 if the project has no Pen Table at all yet).",
+                        "$ref": "#/AttributeIdArrayItem"
+                    },
+                    "pens": {
+                        "type": "array",
+                        "description": "The pens to set in the Pen Table, on top of the 255 pens copied from sourceAttributeId (or the current Pen Table, or an arbitrary existing one - see sourceAttributeId). Only list the pens you actually want to change.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "index": {
+                                    "type": "integer",
+                                    "description": "Index of the pen [1..255].",
+                                    "minimum": 1,
+                                    "maximum": 255
+                                },
+                                "color": {
+                                    "$ref": "#/ColorRGB"
+                                },
+                                "width": {
+                                    "type": "number",
+                                    "description": "Thickness of the pen defined in paper millimeters.",
+                                    "minimum": 0
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "description": "Textual description of the pen."
+                                }
+                            },
+                            "additionalProperties": false,
+                            "required": [
+                                "index"
+                            ]
+                        },
+                        "maxItems": 255
+                    }
+                },
+                "additionalProperties": false,
+                "required": [
+                    "name"
+                ]
             },
-            "overwriteExisting": {
-                "type": "boolean",
-                "description": "Overwrite the Pen Table if exists with the same name, or if index is given with the same index. The default is false."
-            }
+            "minItems": 1,
+            "maxItems": 1000
         },
-        "additionalProperties": false,
+        "overwriteExisting": {
+            "type": "boolean",
+            "description": "Overwrite the Pen Table if exists with the same name, or if index is given with the same index. The default is false."
+        },
+        "ifExists": {
+            "type": "string",
+            "enum": [
+                "Error",
+                "Overwrite",
+                "ReuseIfMatching"
+            ],
+            "description": "Mutually exclusive with overwriteExisting. ReuseIfMatching reuses an existing identity only when name, activity flags and all resulting pens match; differences never write. Missing named tables are created. Omitted pens retain the source values. Numeric tolerance is 1e-9."
+        }
+    },
+    "additionalProperties": false,
+    "required": [
+        "penTableDataArray"
+    ],
+    "not": {
         "required": [
-            "penTableDataArray"
+            "ifExists",
+            "overwriteExisting"
         ]
-    })";
+    }
+})";
 }
 
 GS::Optional<GS::UniString> CreatePenTablesCommand::GetRawResponseSchema () const
@@ -4491,264 +5070,125 @@ GS::Optional<GS::UniString> CreatePenTablesCommand::GetRawResponseSchema () cons
     })";
 }
 
-#ifdef ServerMainVers_2700
 GS::ObjectState CreatePenTablesCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
 {
-    GS::Array<GS::ObjectState> penTableDataArray;
-    parameters.Get ("penTableDataArray", penTableDataArray);
-
-    bool overwriteExisting = false;
-    parameters.Get ("overwriteExisting", overwriteExisting);
-
-    GS::ObjectState response;
-    const auto& attributeIds = response.AddList<GS::ObjectState> ("attributeIds");
-
-    for (const GS::ObjectState& penTableData : penTableDataArray) {
-        API_Attribute penTable = {};
-        API_AttributeDefExt penTableDefs = {};
-        penTable.header.typeID = API_PenTableID;
-
-        GS::UniString name;
-        if (penTableData.Get ("name", name)) {
-            penTable.header.uniStringNamePtr = &name;
-        }
-
-        if (overwriteExisting) {
-            penTable.header.guid = GetGuidFromAttributesArrayItem (penTableData);
-
-            Int32 index = -1;
-            if (penTableData.Get ("index", index) && index >= 0) {
-                penTable.header.index = ACAPI_CreateAttributeIndex (index);
-            }
-        }
-
-        bool doesExist = (ACAPI_Attribute_Get (&penTable) == NoError);
-        if (doesExist && !overwriteExisting) {
-            attributeIds (CreateErrorResponse (APIERR_ATTREXIST, "Already exists."));
-            continue;
-        }
-
-        // ACAPI_Attribute_Get writes the FOUND attribute's current name back through
-        // uniStringNamePtr, clobbering a requested rename with the OLD name before Modify ever sees
-        // it - same bug as CreateAttributesCommandBase, fixed there this session; re-apply here too.
-        if (penTableData.Get ("name", name)) {
-            penTable.header.uniStringNamePtr = &name;
-        }
-
-        penTableData.Get ("isActiveForModel", penTable.penTable.inEffectForModel);
-        penTableData.Get ("isActiveForLayout", penTable.penTable.inEffectForLayout);
-
-        // Every Pen Table always contains all 255 pens, so the ones not explicitly listed by the caller need a
-        // starting value from somewhere. Despite ACAPI_Attribute_GetDefExt's documentation claiming it only
-        // supports lines/fills/composites/layers/zone categories, it works for Pen Tables too (confirmed
-        // empirically) - so we use it to seed the full 255-pen array from a real source: the Pen Table itself
-        // when overwriting (preserves everything not explicitly changed), the explicit sourceAttributeId when
-        // given, or an arbitrary existing Pen Table in the project as a last resort for a brand new one.
-        API_AttributeIndex sourceIndex = APIInvalidAttributeIndex;
-        GS::ObjectState sourceAttributeId;
-        if (penTableData.Get ("sourceAttributeId", sourceAttributeId)) {
-            if (!GetAttributeIndexFromAttributeId (sourceAttributeId, API_PenTableID, sourceIndex)) {
-                attributeIds (CreateErrorResponse (APIERR_BADID, "Source Pen Table not found."));
-                continue;
-            }
-        } else if (doesExist) {
-            sourceIndex = penTable.header.index;
-        } else {
-            GS::Array<API_Attribute> existingPenTables;
-            ACAPI_Attribute_GetAttributesByType (API_PenTableID, existingPenTables);
-            if (!existingPenTables.IsEmpty ()) {
-                sourceIndex = existingPenTables[0].header.index;
-            }
-            for (API_Attribute& existingPenTable : existingPenTables) {
-                DisposeAttribute (existingPenTable);
-            }
-        }
-
-        penTableDefs.penTable_Items = new GS::Array<API_Pen> ();
-        if (sourceIndex.IsPositive ()) {
-            API_AttributeDefExt sourceDefs = {};
-            if (ACAPI_Attribute_GetDefExt (API_PenTableID, sourceIndex, &sourceDefs) == NoError && sourceDefs.penTable_Items != nullptr) {
-                for (const API_Pen& sourcePen : *sourceDefs.penTable_Items) {
-                    penTableDefs.penTable_Items->Push (sourcePen);
-                }
-                ACAPI_DisposeAttrDefsHdlsExt (&sourceDefs);
-            }
-        }
-        for (short i = (short) penTableDefs.penTable_Items->GetSize (); i < 255; ++i) {
-            API_Pen pen = {};
-            pen.index = i + 1;
-            pen.rgb = { 0.0, 0.0, 0.0 };
-            pen.width = 0.1;
-            penTableDefs.penTable_Items->Push (pen);
-        }
-
-        GS::Array<GS::ObjectState> pens;
-        penTableData.Get ("pens", pens);
-        for (const GS::ObjectState& penData : pens) {
-            Int32 penIndex = 0;
-            penData.Get ("index", penIndex);
-            if (penIndex < 1 || penIndex > 255) {
-                continue;
-            }
-
-            API_Pen& pen = (*penTableDefs.penTable_Items)[penIndex - 1];
-            GetColor (penData, "color", pen.rgb);
-            penData.Get ("width", pen.width);
-            SetCharProperty (&penData, "description", pen.description);
-        }
-
-        if (doesExist) {
-            GSErrCode err = ACAPI_Attribute_ModifyExt (&penTable, &penTableDefs);
-            if (err != NoError) {
-                attributeIds (CreateErrorResponse (err, "Failed to modify."));
-                ACAPI_DisposeAttrDefsHdlsExt (&penTableDefs);
-                continue;
-            }
-        } else {
-            GSErrCode err = ACAPI_Attribute_CreateExt (&penTable, &penTableDefs);
-            if (err != NoError) {
-                attributeIds (CreateErrorResponse (err, "Failed to create."));
-                ACAPI_DisposeAttrDefsHdlsExt (&penTableDefs);
-                continue;
-            }
-        }
-
-        attributeIds (CreateAttributeIdObjectState (penTable.header.guid));
-        ACAPI_DisposeAttrDefsHdlsExt (&penTableDefs);
+    GS::Array<GS::ObjectState> items;
+    parameters.Get ("penTableDataArray",items);
+    if (items.IsEmpty () || items.GetSize ()>1000) return CreateErrorResponse (APIERR_BADPARS,"Supply 1..1000 pen tables.");
+    bool overwrite=false;
+    parameters.Get ("overwriteExisting",overwrite);
+    GS::UniString policy=overwrite ? "Overwrite" : "Error";
+    if (parameters.Contains ("ifExists")) {
+        if (parameters.Contains ("overwriteExisting") || !parameters.Get ("ifExists",policy) ||
+            (policy!="Error" && policy!="Overwrite" && policy!="ReuseIfMatching")) return CreateErrorResponse (APIERR_BADPARS,"Supply one valid collision policy.");
+        overwrite=policy=="Overwrite";
     }
-
-    return response;
-}
-#else
-// Before AC27, the pen array element type is API_PenType (not API_Pen): the pen index lives in head.index
-// (not a plain index field), description is a plain char[128] (not GS::uchar_t[128]), and penTable_Items is an
-// old-style handle of 255 contiguous elements (not a GS::Array). Otherwise the logic mirrors the AC27+ version
-// above exactly, including the auto-seeding of unlisted pens from an existing Pen Table.
-GS::ObjectState CreatePenTablesCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
-{
-    GS::Array<GS::ObjectState> penTableDataArray;
-    parameters.Get ("penTableDataArray", penTableDataArray);
-
-    bool overwriteExisting = false;
-    parameters.Get ("overwriteExisting", overwriteExisting);
-
+    const bool reuse=policy=="ReuseIfMatching";
     GS::ObjectState response;
-    const auto& attributeIds = response.AddList<GS::ObjectState> ("attributeIds");
-
-    for (const GS::ObjectState& penTableData : penTableDataArray) {
-        API_Attribute penTable = {};
-        API_AttributeDefExt penTableDefs = {};
-        penTable.header.typeID = API_PenTableID;
-
-        GS::UniString name;
-        if (penTableData.Get ("name", name)) {
-            penTable.header.uniStringNamePtr = &name;
+    const auto& results=response.AddList<GS::ObjectState> ("attributeIds");
+    for (const auto& item:items) {
+#ifndef ServerMainVers_2700
+        if (item.Contains ("isActiveForModel") || item.Contains ("isActiveForLayout")) {
+            results (CreateErrorResponse (APIERR_BADPARS,"Active pen table settings require Archicad 27 or newer.")); continue;
         }
-
-        if (overwriteExisting) {
-            penTable.header.guid = GetGuidFromAttributesArrayItem (penTableData);
-
-            Int32 index = -1;
-            if (penTableData.Get ("index", index) && index >= 0) {
-                penTable.header.index = ACAPI_CreateAttributeIndex (index);
-            }
-        }
-
-        bool doesExist = (ACAPI_Attribute_Get (&penTable) == NoError);
-        if (doesExist && !overwriteExisting) {
-            attributeIds (CreateErrorResponse (APIERR_ATTREXIST, "Already exists."));
-            continue;
-        }
-
-        // ACAPI_Attribute_Get writes the FOUND attribute's current name back through
-        // uniStringNamePtr, clobbering a requested rename with the OLD name before Modify ever sees
-        // it - same bug as CreateAttributesCommandBase, fixed there this session; re-apply here too.
-        if (penTableData.Get ("name", name)) {
-            penTable.header.uniStringNamePtr = &name;
-        }
-
-        // isActiveForModel/isActiveForLayout have no equivalent in the pre-AC27 API_PenTableType, so they are
-        // silently ignored on these older versions.
-
-        API_AttributeIndex sourceIndex = APIInvalidAttributeIndex;
-        GS::ObjectState sourceAttributeId;
-        if (penTableData.Get ("sourceAttributeId", sourceAttributeId)) {
-            if (!GetAttributeIndexFromAttributeId (sourceAttributeId, API_PenTableID, sourceIndex)) {
-                attributeIds (CreateErrorResponse (APIERR_BADID, "Source Pen Table not found."));
-                continue;
-            }
-        } else if (doesExist) {
-            sourceIndex = penTable.header.index;
-        } else {
-            GS::Array<API_Attribute> existingPenTables;
-            ACAPI_Attribute_GetAttributesByType (API_PenTableID, existingPenTables);
-            if (!existingPenTables.IsEmpty ()) {
-                sourceIndex = existingPenTables[0].header.index;
-            }
-            for (API_Attribute& existingPenTable : existingPenTables) {
-                DisposeAttribute (existingPenTable);
-            }
-        }
-
-        penTableDefs.penTable_Items = (API_PenType**) BMAllocateHandle (255 * sizeof (API_PenType), ALLOCATE_CLEAR, 0);
-
-        bool seeded = false;
-        if (IsPositiveAttributeIndex (sourceIndex)) {
-            API_AttributeDefExt sourceDefs = {};
-            if (ACAPI_Attribute_GetDefExt (API_PenTableID, sourceIndex, &sourceDefs) == NoError && sourceDefs.penTable_Items != nullptr) {
-                for (UInt32 i = 0; i < 255; ++i) {
-                    (*penTableDefs.penTable_Items)[i] = (*sourceDefs.penTable_Items)[i];
-                }
-                seeded = true;
-                ACAPI_DisposeAttrDefsHdlsExt (&sourceDefs);
-            }
-        }
-        if (!seeded) {
-            for (short i = 0; i < 255; ++i) {
-                API_PenType& pen = (*penTableDefs.penTable_Items)[i];
-                pen.head.index = ACAPI_CreateAttributeIndex (i + 1);
-                pen.width = 0.1;
-            }
-        }
-
-        GS::Array<GS::ObjectState> pens;
-        penTableData.Get ("pens", pens);
-        for (const GS::ObjectState& penData : pens) {
-            Int32 penIndex = 0;
-            penData.Get ("index", penIndex);
-            if (penIndex < 1 || penIndex > 255) {
-                continue;
-            }
-
-            API_PenType& pen = (*penTableDefs.penTable_Items)[penIndex - 1];
-            GetColor (penData, "color", pen.rgb);
-            penData.Get ("width", pen.width);
-            SetCharProperty (&penData, "description", pen.description);
-        }
-
-        if (doesExist) {
-            GSErrCode err = ACAPI_Attribute_ModifyExt (&penTable, &penTableDefs);
-            if (err != NoError) {
-                attributeIds (CreateErrorResponse (err, "Failed to modify."));
-                ACAPI_DisposeAttrDefsHdlsExt (&penTableDefs);
-                continue;
-            }
-        } else {
-            GSErrCode err = ACAPI_Attribute_CreateExt (&penTable, &penTableDefs);
-            if (err != NoError) {
-                attributeIds (CreateErrorResponse (err, "Failed to create."));
-                ACAPI_DisposeAttrDefsHdlsExt (&penTableDefs);
-                continue;
-            }
-        }
-
-        attributeIds (CreateAttributeIdObjectState (penTable.header.guid));
-        ACAPI_DisposeAttrDefsHdlsExt (&penTableDefs);
-    }
-
-    return response;
-}
 #endif
+        API_Attribute table={}; table.header.typeID=API_PenTableID;
+        GS::UniString name;
+        if (!item.Get ("name",name) || name.IsEmpty ()) { results (CreateErrorResponse (APIERR_BADPARS,"A nonempty pen table name is required.")); continue; }
+        table.header.uniStringNamePtr=&name;
+        if (overwrite || reuse) {
+            table.header.guid=GetGuidFromAttributesArrayItem (item);
+            Int32 index=0; if (item.Get ("index",index) && index>0) table.header.index=ACAPI_CreateAttributeIndex (index);
+        }
+        bool exists=false;
+        const auto lookup=FindAttributeForWrite (item,overwrite || reuse,table,exists);
+        if (lookup!=NoError) { results (CreateErrorResponse (lookup,"Cannot resolve the requested pen table.")); continue; }
+        if (exists && !overwrite && !reuse) { results (CreateErrorResponse (APIERR_ATTREXIST,"Already exists.")); continue; }
+        const auto original=table; const GS::UniString originalName=name;
+        item.Get ("name",name);
+#ifdef ServerMainVers_2700
+        item.Get ("isActiveForModel",table.penTable.inEffectForModel);
+        item.Get ("isActiveForLayout",table.penTable.inEffectForLayout);
+#endif
+        API_AttributeIndex sourceIndex=APIInvalidAttributeIndex;
+        GS::ObjectState sourceId;
+        if (item.Get ("sourceAttributeId",sourceId)) {
+            if (!GetAttributeIndexFromAttributeId (sourceId,API_PenTableID,sourceIndex)) { results (CreateErrorResponse (APIERR_BADID,"Source pen table not found.")); continue; }
+        } else if (exists) sourceIndex=table.header.index;
+        else {
+            GS::Array<API_Attribute> sources;
+            const auto readError=ACAPI_Attribute_GetAttributesByType (API_PenTableID,sources);
+            const GS::OnExit disposeSources ([&] { for (auto& source:sources) DisposeAttribute(source); });
+            if (readError!=NoError) { results (CreateErrorResponse (readError,"Cannot enumerate source pen tables.")); continue; }
+            if (!sources.IsEmpty ()) sourceIndex=sources[0].header.index;
+        }
+        API_AttributeDefExt definition={};
+        const GS::OnExit dispose ([&] { ACAPI_DisposeAttrDefsHdlsExt (&definition); });
+        if (IsPositiveAttributeIndex (sourceIndex)) {
+            const auto readError=ACAPI_Attribute_GetDefExt (API_PenTableID,sourceIndex,&definition);
+            if (readError!=NoError || definition.penTable_Items==nullptr) { results (CreateErrorResponse (readError==NoError ? APIERR_GENERAL : readError,"Cannot read source pens; no fallback values substituted.")); continue; }
+        } else {
+#ifdef ServerMainVers_2700
+            definition.penTable_Items=new GS::Array<API_Pen> ();
+            for (short i=1;i<=255;++i) { API_Pen pen={}; pen.index=i; pen.width=0.1; definition.penTable_Items->Push(pen); }
+#else
+            definition.penTable_Items=(API_PenType**) BMAllocateHandle (255*sizeof(API_PenType),ALLOCATE_CLEAR,0);
+            if (definition.penTable_Items==nullptr) { results (CreateErrorResponse (APIERR_MEMFULL,"Cannot allocate pens.")); continue; }
+            for (short i=1;i<=255;++i) { auto& pen=(*definition.penTable_Items)[i-1]; pen.head.index=ACAPI_CreateAttributeIndex(i); pen.width=0.1; }
+#endif
+        }
+        const auto validDefinition=[] (const API_AttributeDefExt& value) {
+            if (value.penTable_Items==nullptr) return false;
+#ifdef ServerMainVers_2700
+            if (value.penTable_Items->GetSize ()!=255) return false;
+            for (short i=0;i<255;++i) if ((*value.penTable_Items)[i].index!=i+1) return false;
+#else
+            if (BMhGetSize (reinterpret_cast<GSHandle> (value.penTable_Items))!=255*sizeof(API_PenType)) return false;
+            for (short i=0;i<255;++i) if ((*value.penTable_Items)[i].head.index!=ACAPI_CreateAttributeIndex(i+1)) return false;
+#endif
+            return true;
+        };
+        if (!validDefinition(definition)) { results (CreateErrorResponse (APIERR_GENERAL,"Source must contain 255 ordered pens; no pen table written.")); continue; }
+        GS::Array<GS::ObjectState> pens; item.Get ("pens",pens);
+        bool valid=pens.GetSize ()<=255; bool seen[256]={};
+        for (const auto& patch:pens) {
+            Int32 index=0;
+            if (!patch.Get ("index",index) || index<1 || index>255 || seen[index]) { valid=false; break; }
+            seen[index]=true;
+            auto& pen=(*definition.penTable_Items)[index-1];
+            GetColor (patch,"color",pen.rgb); patch.Get ("width",pen.width);
+            if (!std::isfinite(pen.width) || pen.width<0 || !std::isfinite(pen.rgb.f_red) || !std::isfinite(pen.rgb.f_green) || !std::isfinite(pen.rgb.f_blue) ||
+                pen.rgb.f_red<0 || pen.rgb.f_red>1 || pen.rgb.f_green<0 || pen.rgb.f_green>1 || pen.rgb.f_blue<0 || pen.rgb.f_blue>1) { valid=false; break; }
+            GS::UniString description;
+            if (patch.Get ("description",description)) {
+                SetCharProperty (&patch,"description",pen.description);
+                if (GS::UniString(pen.description)!=description) { valid=false; break; }
+            }
+        }
+        if (!valid) { results (CreateErrorResponse (APIERR_BADPARS,"Invalid or repeated pen index, color, width or unrepresentable description; no pen table written.")); continue; }
+        if (exists && reuse) {
+            API_AttributeDefExt previous={};
+            const GS::OnExit disposePrevious ([&] { ACAPI_DisposeAttrDefsHdlsExt (&previous); });
+            const auto readError=ACAPI_Attribute_GetDefExt (API_PenTableID,original.header.index,&previous);
+            if (readError!=NoError || !validDefinition(previous)) { results (CreateErrorResponse (readError==NoError ? APIERR_GENERAL : readError,"Cannot compare the existing pen table.")); continue; }
+            bool matches=originalName==name;
+#ifdef ServerMainVers_2700
+            matches=matches && original.penTable.inEffectForModel==table.penTable.inEffectForModel && original.penTable.inEffectForLayout==table.penTable.inEffectForLayout;
+#endif
+            const auto number=[] (double a,double b) { return std::isfinite(a) && std::isfinite(b) && std::abs(a-b)<=1e-9; };
+            for (short i=0;i<255 && matches;++i) {
+                const auto& a=(*previous.penTable_Items)[i]; const auto& b=(*definition.penTable_Items)[i];
+                matches=number(a.width,b.width) && number(a.rgb.f_red,b.rgb.f_red) && number(a.rgb.f_green,b.rgb.f_green) && number(a.rgb.f_blue,b.rgb.f_blue) && GS::UniString(a.description)==GS::UniString(b.description);
+            }
+            if (!matches) { results (CreateErrorResponse (APIERR_ATTREXIST,"Existing pen table differs; ReuseIfMatching makes no changes.")); continue; }
+            results (CreateAttributeIdObjectState (table.header.guid)); continue;
+        }
+        const auto writeError=exists ? ACAPI_Attribute_ModifyExt (&table,&definition) : ACAPI_Attribute_CreateExt (&table,&definition);
+        if (writeError!=NoError) { results (CreateErrorResponse (writeError,exists ? "Failed to modify pen table." : "Failed to create pen table.")); continue; }
+        results (CreateAttributeIdObjectState (table.header.guid));
+    }
+    return response;
+}
 
 CreateProfilesCommand::CreateProfilesCommand () :
     CommandBase (CommonSchema::Used)
@@ -4763,238 +5203,266 @@ GS::String CreateProfilesCommand::GetName () const
 GS::Optional<GS::UniString> CreateProfilesCommand::GetInputParametersSchema () const
 {
     return R"({
-        "type": "object",
-        "properties": {
-            "profileDataArray": {
-                "type": "array",
-                "description" : "Array of data to create new Profiles.",
-                "items": {
-                    "type": "object",
-                    "description": "Data to create or modify a Profile. Its geometry (the cross-section shape) comes from sourceAttributeId (an existing Profile's geometry, copied), from newSkins (AC27+ only, caller-supplied polygon geometry), or both combined. When creating a brand-new Profile (overwriteExisting false, or true but no existing match), at least one of the two must be given. When overwriteExisting targets an existing Profile, both are optional - the existing Profile's own current geometry is preserved by default (e.g. to change only wallType, or to add newSkins on top of the unchanged existing shape). skinOverrides and newSkins' edgeOverrides target skins/edges by the identifiers/indices GetProfiles reports.",
-                    "properties": {
-                        "attributeId": {
-                            "description": "Indentifier of the existing Profile to overwrite, ignored if overwriteExisting is false.",
-                            "$ref": "#/AttributeId"
-                        },
-                        "index": {
-                            "type": "string",
-                            "description": "Index of the existing Profile to overwrite, ignored if overwriteExisting is false."
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "Name. If overwriteExisting is true, then the existing Profile with the given name will be overwritten."
-                        },
-                        "sourceAttributeId": {
-                            "description": "Identifier of an existing Profile whose geometry (cross-section shape) will be copied as the starting point. Optional if newSkins is given: omit it to build the Profile's geometry entirely from newSkins instead of copying anything (AC27+ only).",
-                            "$ref": "#/AttributeIdArrayItem"
-                        },
-                        "wallType": {
-                            "type": "boolean",
-                            "description": "Profile available for walls. Defaults to the source Profile's value."
-                        },
-                        "beamType": {
-                            "type": "boolean",
-                            "description": "Profile available for beams. Defaults to the source Profile's value."
-                        },
-                        "coluType": {
-                            "type": "boolean",
-                            "description": "Profile available for columns. Defaults to the source Profile's value."
-                        },
-                        "handrailType": {
-                            "type": "boolean",
-                            "description": "Profile available for handrails. Defaults to the source Profile's value."
-                        },
-                        "otherGDLObjectType": {
-                            "type": "boolean",
-                            "description": "Profile available for other GDL based objects. Defaults to the source Profile's value."
-                        },
-                        "skinOverrides": {
-                            "type": "array",
-                            "description": "Modifications to apply to specific skins of the copied geometry, e.g. to change a skin's building material without rebuilding the profile's shape. Each skinId comes from a prior GetProfiles call's skins[].skinId on the source Profile (or, when overwriteExisting is true, on the Profile being overwritten).",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "skinId": {
-                                        "type": "string",
-                                        "description": "Identifies which skin to modify, from GetProfiles' skins[].skinId."
-                                    },
-                                    "buildingMaterialId": {
-                                        "$ref": "#/AttributeIdArrayItem"
-                                    },
-                                    "surfaceId": {
-                                        "$ref": "#/AttributeIdArrayItem"
-                                    },
-                                    "fillId": {
-                                        "$ref": "#/AttributeIdArrayItem"
-                                    },
-                                    "contourPen": {
-                                        "type": "integer"
-                                    },
-                                    "contourLineTypeId": {
-                                        "$ref": "#/AttributeIdArrayItem"
-                                    },
-                                    "isCore": {
-                                        "type": "boolean"
-                                    },
-                                    "isFinish": {
-                                        "type": "boolean"
-                                    },
-                                    "visibleCutEndLines": {
-                                        "type": "boolean"
-                                    },
-                                    "cutEndLinePen": {
-                                        "type": "integer"
-                                    },
-                                    "cutEndLineTypeId": {
-                                        "$ref": "#/AttributeIdArrayItem"
-                                    },
-                                    "edgeOverrides": {
-                                        "type": "array",
-                                        "description": "Modifications to specific edges of this skin, targeted by their position (0-based) in GetProfiles' skins[].edges.",
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "edgeIndex": {
-                                                    "type": "integer"
-                                                },
-                                                "pen": {
-                                                    "type": "integer"
-                                                },
-                                                "isVisibleLine": {
-                                                    "type": "boolean"
-                                                },
-                                                "lineTypeId": {
-                                                    "$ref": "#/AttributeIdArrayItem"
-                                                },
-                                                "buildingMaterialId": {
-                                                    "$ref": "#/AttributeIdArrayItem"
-                                                }
-                                            },
-                                            "additionalProperties": false,
-                                            "required": ["edgeIndex"]
-                                        }
-                                    }
+    "type": "object",
+    "properties": {
+        "profileDataArray": {
+            "type": "array",
+            "description": "Array of data to create new Profiles.",
+            "items": {
+                "type": "object",
+                "description": "Data to create or modify a Profile. Its geometry (the cross-section shape) comes from sourceAttributeId (an existing Profile's geometry, copied), from newSkins (AC27+ only, caller-supplied polygon geometry), or both combined. When creating a brand-new Profile (overwriteExisting false, or true but no existing match), at least one of the two must be given. When overwriteExisting targets an existing Profile, both are optional - the existing Profile's own current geometry is preserved by default (e.g. to change only wallType, or to add newSkins on top of the unchanged existing shape). skinOverrides and newSkins' edgeOverrides target skins/edges by the identifiers/indices GetProfiles reports.",
+                "properties": {
+                    "attributeId": {
+                        "description": "Existing profile identity for Overwrite or ReuseIfMatching. Specify only one identity selector.",
+                        "$ref": "#/AttributeId"
+                    },
+                    "index": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Existing profile identity for Overwrite or ReuseIfMatching. Specify only one identity selector."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name. If overwriteExisting is true, then the existing Profile with the given name will be overwritten."
+                    },
+                    "sourceAttributeId": {
+                        "description": "Identifier of an existing Profile whose geometry (cross-section shape) will be copied as the starting point. Optional if newSkins is given: omit it to build the Profile's geometry entirely from newSkins instead of copying anything (AC27+ only).",
+                        "$ref": "#/AttributeIdArrayItem"
+                    },
+                    "wallType": {
+                        "type": "boolean",
+                        "description": "Profile available for walls. Defaults to the source Profile's value."
+                    },
+                    "beamType": {
+                        "type": "boolean",
+                        "description": "Profile available for beams. Defaults to the source Profile's value."
+                    },
+                    "coluType": {
+                        "type": "boolean",
+                        "description": "Profile available for columns. Defaults to the source Profile's value."
+                    },
+                    "handrailType": {
+                        "type": "boolean",
+                        "description": "Profile available for handrails. Defaults to the source Profile's value."
+                    },
+                    "otherGDLObjectType": {
+                        "type": "boolean",
+                        "description": "Profile available for other GDL based objects. Defaults to the source Profile's value."
+                    },
+                    "skinOverrides": {
+                        "type": "array",
+                        "description": "Modifications to apply to specific skins of the copied geometry, e.g. to change a skin's building material without rebuilding the profile's shape. Each skinId comes from a prior GetProfiles call's skins[].skinId on the source Profile (or, when overwriteExisting is true, on the Profile being overwritten).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "skinId": {
+                                    "type": "string",
+                                    "description": "Identifies which skin to modify, from GetProfiles' skins[].skinId."
                                 },
-                                "additionalProperties": false,
-                                "required": ["skinId"]
-                            }
-                        },
-                        "newSkins": {
-                            "type": "array",
-                            "description": "AC27+ only. Adds brand-new skins built from caller-supplied polygon geometry, instead of (or in addition to) whatever was copied from sourceAttributeId. Combine with sourceAttributeId to add skins to a copied Profile, or omit sourceAttributeId to build a Profile's geometry entirely from newSkins.",
-                            "items": {
-                                "type": "object",
-                                "description": "One new skin (hatch). Its shape is one or more closed polygon contours: the first is the outer boundary, any further ones are holes cut out of it - the same polygon+holes convention as e.g. CreateSlabs' polygonCoordinates/polygonArcs/holes, just expressed as a list of contours instead of a separate holes array.",
-                                "properties": {
-                                    "contours": {
-                                        "type": "array",
-                                        "description": "Closed polygon contours forming this skin's cross-section, in the Profile's local coordinate system. Each contour is closed automatically - do not repeat its first vertex at the end.",
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "polygonCoordinates": {
-                                                    "type": "array",
-                                                    "description": "The 2D coordinates of this contour.",
-                                                    "items": {
-                                                        "$ref": "#/Coordinate2D"
-                                                    },
-                                                    "minItems": 3
-                                                },
-                                                "polygonArcs": {
-                                                    "type": "array",
-                                                    "description": "Optional arcs along this contour's edges. begIndex/endIndex are 0-based positions within this contour's own polygonCoordinates.",
-                                                    "items": {
-                                                        "$ref": "#/PolyArc"
-                                                    }
-                                                }
+                                "buildingMaterialId": {
+                                    "$ref": "#/AttributeIdArrayItem"
+                                },
+                                "surfaceId": {
+                                    "$ref": "#/AttributeIdArrayItem"
+                                },
+                                "fillId": {
+                                    "$ref": "#/AttributeIdArrayItem"
+                                },
+                                "contourPen": {
+                                    "type": "integer"
+                                },
+                                "contourLineTypeId": {
+                                    "$ref": "#/AttributeIdArrayItem"
+                                },
+                                "isCore": {
+                                    "type": "boolean"
+                                },
+                                "isFinish": {
+                                    "type": "boolean"
+                                },
+                                "visibleCutEndLines": {
+                                    "type": "boolean"
+                                },
+                                "cutEndLinePen": {
+                                    "type": "integer"
+                                },
+                                "cutEndLineTypeId": {
+                                    "$ref": "#/AttributeIdArrayItem"
+                                },
+                                "edgeOverrides": {
+                                    "type": "array",
+                                    "description": "Modifications to specific edges of this skin, targeted by their position (0-based) in GetProfiles' skins[].edges.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "edgeIndex": {
+                                                "type": "integer"
                                             },
-                                            "additionalProperties": false,
-                                            "required": ["polygonCoordinates"]
+                                            "pen": {
+                                                "type": "integer"
+                                            },
+                                            "isVisibleLine": {
+                                                "type": "boolean"
+                                            },
+                                            "lineTypeId": {
+                                                "$ref": "#/AttributeIdArrayItem"
+                                            },
+                                            "buildingMaterialId": {
+                                                "$ref": "#/AttributeIdArrayItem"
+                                            }
                                         },
-                                        "minItems": 1
-                                    },
-                                    "buildingMaterialId": {
-                                        "$ref": "#/AttributeIdArrayItem"
-                                    },
-                                    "surfaceId": {
-                                        "$ref": "#/AttributeIdArrayItem"
-                                    },
-                                    "fillId": {
-                                        "$ref": "#/AttributeIdArrayItem"
-                                    },
-                                    "contourPen": {
-                                        "type": "integer"
-                                    },
-                                    "contourLineTypeId": {
-                                        "$ref": "#/AttributeIdArrayItem"
-                                    },
-                                    "isCore": {
-                                        "type": "boolean"
-                                    },
-                                    "isFinish": {
-                                        "type": "boolean"
-                                    },
-                                    "visibleCutEndLines": {
-                                        "type": "boolean"
-                                    },
-                                    "cutEndLinePen": {
-                                        "type": "integer"
-                                    },
-                                    "cutEndLineTypeId": {
-                                        "$ref": "#/AttributeIdArrayItem"
-                                    },
-                                    "edgeOverrides": {
-                                        "type": "array",
-                                        "description": "Per-edge pen/visibility/line type, targeted by 0-based edge index. Edge indices follow the same order as this skin's contours/polygonCoordinates: the outer contour's edges first (one edge per vertex, wrapping around), then each hole's, in the order the contours were given. Verify exact indices for a created skin via a follow-up GetProfiles call's skins[].edges before relying on them.",
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "edgeIndex": {
-                                                    "type": "integer"
-                                                },
-                                                "pen": {
-                                                    "type": "integer"
-                                                },
-                                                "isVisibleLine": {
-                                                    "type": "boolean"
-                                                },
-                                                "lineTypeId": {
-                                                    "$ref": "#/AttributeIdArrayItem"
-                                                },
-                                                "buildingMaterialId": {
-                                                    "$ref": "#/AttributeIdArrayItem"
-                                                }
-                                            },
-                                            "additionalProperties": false,
-                                            "required": ["edgeIndex"]
-                                        }
+                                        "additionalProperties": false,
+                                        "required": [
+                                            "edgeIndex"
+                                        ]
                                     }
-                                },
-                                "additionalProperties": false,
-                                "required": ["contours"]
-                            }
-                        },
-                        "replaceSkins": {
-                            "type": "boolean",
-                            "description": "AC27+ only. When overwriteExisting targets an existing Profile, discard every one of its existing skins (and any sourceAttributeId geometry given alongside it) before applying newSkins, instead of adding newSkins on top of the preserved existing geometry. Use this to fully replace a Profile's cross-section with a caller-authored shape while keeping its guid and scalar fields (wallType etc.) - e.g. to sync a Profile's geometry from another project, where sourceAttributeId can't be used because it only resolves within the same file. Also discards any existing profileModifiers, since those are tied to the specific geometry being replaced. Ignored when creating a brand-new Profile (there is nothing to discard yet)."
+                                }
+                            },
+                            "additionalProperties": false,
+                            "required": [
+                                "skinId"
+                            ]
                         }
                     },
-                    "additionalProperties": false,
-                    "required" : [
-                        "name"
-                    ]
-                }
+                    "newSkins": {
+                        "type": "array",
+                        "description": "AC27+ only. Adds brand-new skins built from caller-supplied polygon geometry, instead of (or in addition to) whatever was copied from sourceAttributeId. Combine with sourceAttributeId to add skins to a copied Profile, or omit sourceAttributeId to build a Profile's geometry entirely from newSkins.",
+                        "items": {
+                            "type": "object",
+                            "description": "One new skin (hatch). Its shape is one or more closed polygon contours: the first is the outer boundary, any further ones are holes cut out of it - the same polygon+holes convention as e.g. CreateSlabs' polygonCoordinates/polygonArcs/holes, just expressed as a list of contours instead of a separate holes array.",
+                            "properties": {
+                                "contours": {
+                                    "type": "array",
+                                    "description": "Closed polygon contours forming this skin's cross-section, in the Profile's local coordinate system. Each contour is closed automatically - do not repeat its first vertex at the end.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "polygonCoordinates": {
+                                                "type": "array",
+                                                "description": "The 2D coordinates of this contour.",
+                                                "items": {
+                                                    "$ref": "#/Coordinate2D"
+                                                },
+                                                "minItems": 3
+                                            },
+                                            "polygonArcs": {
+                                                "type": "array",
+                                                "description": "Optional arcs along this contour's edges. begIndex/endIndex are 0-based positions within this contour's own polygonCoordinates.",
+                                                "items": {
+                                                    "$ref": "#/PolyArc"
+                                                }
+                                            }
+                                        },
+                                        "additionalProperties": false,
+                                        "required": [
+                                            "polygonCoordinates"
+                                        ]
+                                    },
+                                    "minItems": 1
+                                },
+                                "buildingMaterialId": {
+                                    "$ref": "#/AttributeIdArrayItem"
+                                },
+                                "surfaceId": {
+                                    "$ref": "#/AttributeIdArrayItem"
+                                },
+                                "fillId": {
+                                    "$ref": "#/AttributeIdArrayItem"
+                                },
+                                "contourPen": {
+                                    "type": "integer"
+                                },
+                                "contourLineTypeId": {
+                                    "$ref": "#/AttributeIdArrayItem"
+                                },
+                                "isCore": {
+                                    "type": "boolean"
+                                },
+                                "isFinish": {
+                                    "type": "boolean"
+                                },
+                                "visibleCutEndLines": {
+                                    "type": "boolean"
+                                },
+                                "cutEndLinePen": {
+                                    "type": "integer"
+                                },
+                                "cutEndLineTypeId": {
+                                    "$ref": "#/AttributeIdArrayItem"
+                                },
+                                "edgeOverrides": {
+                                    "type": "array",
+                                    "description": "Per-edge pen/visibility/line type, targeted by 0-based edge index. Edge indices follow the same order as this skin's contours/polygonCoordinates: the outer contour's edges first (one edge per vertex, wrapping around), then each hole's, in the order the contours were given. Verify exact indices for a created skin via a follow-up GetProfiles call's skins[].edges before relying on them.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "edgeIndex": {
+                                                "type": "integer"
+                                            },
+                                            "pen": {
+                                                "type": "integer"
+                                            },
+                                            "isVisibleLine": {
+                                                "type": "boolean"
+                                            },
+                                            "lineTypeId": {
+                                                "$ref": "#/AttributeIdArrayItem"
+                                            },
+                                            "buildingMaterialId": {
+                                                "$ref": "#/AttributeIdArrayItem"
+                                            }
+                                        },
+                                        "additionalProperties": false,
+                                        "required": [
+                                            "edgeIndex"
+                                        ]
+                                    }
+                                }
+                            },
+                            "additionalProperties": false,
+                            "required": [
+                                "contours"
+                            ]
+                        }
+                    },
+                    "replaceSkins": {
+                        "type": "boolean",
+                        "description": "AC27+ only. When overwriteExisting targets an existing Profile, discard every one of its existing skins (and any sourceAttributeId geometry given alongside it) before applying newSkins, instead of adding newSkins on top of the preserved existing geometry. Use this to fully replace a Profile's cross-section with a caller-authored shape while keeping its guid and scalar fields (wallType etc.) - e.g. to sync a Profile's geometry from another project, where sourceAttributeId can't be used because it only resolves within the same file. Also discards any existing profileModifiers, since those are tied to the specific geometry being replaced. Ignored when creating a brand-new Profile (there is nothing to discard yet)."
+                    }
+                },
+                "additionalProperties": false,
+                "required": [
+                    "name"
+                ]
             },
-            "overwriteExisting": {
-                "type": "boolean",
-                "description": "Overwrite the Profile if exists with the same name, or if index is given with the same index. The default is false."
-            }
+            "minItems": 1,
+            "maxItems": 1000
         },
-        "additionalProperties": false,
+        "overwriteExisting": {
+            "type": "boolean",
+            "description": "Overwrite the Profile if exists with the same name, or if index is given with the same index. The default is false."
+        },
+        "ifExists": {
+            "type": "string",
+            "enum": [
+                "Error",
+                "Overwrite",
+                "ReuseIfMatching"
+            ],
+            "description": "Mutually exclusive with overwriteExisting. ReuseIfMatching compares name, usage flags, native profile image and modifier names before reusing an existing identity without writing. This is exact native profile equality, not visual similarity; recreated skins with new internal identities can conflict. Missing named profiles are created."
+        }
+    },
+    "additionalProperties": false,
+    "required": [
+        "profileDataArray"
+    ],
+    "not": {
         "required": [
-            "profileDataArray"
+            "ifExists",
+            "overwriteExisting"
         ]
-    })";
+    }
+})";
 }
 
 GS::Optional<GS::UniString> CreateProfilesCommand::GetRawResponseSchema () const
@@ -5017,9 +5485,17 @@ GS::ObjectState CreateProfilesCommand::Execute (const GS::ObjectState& parameter
 {
     GS::Array<GS::ObjectState> profileDataArray;
     parameters.Get ("profileDataArray", profileDataArray);
+    if (profileDataArray.IsEmpty () || profileDataArray.GetSize ()>1000) return CreateErrorResponse (APIERR_BADPARS,"Supply 1..1000 profiles.");
 
     bool overwriteExisting = false;
     parameters.Get ("overwriteExisting", overwriteExisting);
+    GS::UniString policy=overwriteExisting ? "Overwrite" : "Error";
+    if (parameters.Contains ("ifExists")) {
+        if (parameters.Contains ("overwriteExisting") || !parameters.Get ("ifExists",policy) ||
+            (policy!="Error" && policy!="Overwrite" && policy!="ReuseIfMatching")) return CreateErrorResponse (APIERR_BADPARS,"Supply one valid profile collision policy.");
+        overwriteExisting=policy=="Overwrite";
+    }
+    const bool reuseMatching=policy=="ReuseIfMatching";
 
     GS::ObjectState response;
     const auto& attributeIds = response.AddList<GS::ObjectState> ("attributeIds");
@@ -5033,7 +5509,7 @@ GS::ObjectState CreateProfilesCommand::Execute (const GS::ObjectState& parameter
             profile.header.uniStringNamePtr = &name;
         }
 
-        if (overwriteExisting) {
+        if (overwriteExisting || reuseMatching) {
             profile.header.guid = GetGuidFromAttributesArrayItem (profileData);
 
             Int32 index = -1;
@@ -5042,11 +5518,19 @@ GS::ObjectState CreateProfilesCommand::Execute (const GS::ObjectState& parameter
             }
         }
 
-        bool doesExist = (ACAPI_Attribute_Get (&profile) == NoError);
-        if (doesExist && !overwriteExisting) {
+        bool doesExist=false;
+        const GSErrCode lookupError=FindAttributeForWrite (profileData,overwriteExisting || reuseMatching,profile,doesExist);
+        if (lookupError!=NoError) {
+            attributeIds (CreateErrorResponse (lookupError,"Cannot resolve the requested resource; no new attribute created."));
+            continue;
+        }
+        if (doesExist && !overwriteExisting && !reuseMatching) {
             attributeIds (CreateErrorResponse (APIERR_ATTREXIST, "Already exists."));
             continue;
         }
+
+        const API_Attribute original=profile;
+        const GS::UniString originalName=name;
 
         // ACAPI_Attribute_Get writes the FOUND attribute's current name back through
         // uniStringNamePtr, clobbering a requested rename with the OLD name before Modify ever sees
@@ -5062,7 +5546,7 @@ GS::ObjectState CreateProfilesCommand::Execute (const GS::ObjectState& parameter
         profileData.Get ("newSkins", newSkins);
 
 #ifndef ServerMainVers_2700
-        if (!hasSource) {
+        if (!hasSource && !doesExist) {
             attributeIds (CreateErrorResponse (APIERR_BADPARS, "sourceAttributeId is required on this Archicad version."));
             continue;
         }
@@ -5078,6 +5562,7 @@ GS::ObjectState CreateProfilesCommand::Execute (const GS::ObjectState& parameter
 #endif
 
         API_AttributeDefExt sourceDefs = {};
+        const GS::OnExit disposeSource ([&] { ACAPI_DisposeAttrDefsHdlsExt (&sourceDefs); });
         bool hasSourceDefs = false;
         if (hasSource) {
             API_AttributeIndex sourceIndex;
@@ -5112,9 +5597,12 @@ GS::ObjectState CreateProfilesCommand::Execute (const GS::ObjectState& parameter
             // ACAPI_Attribute_Get existence check above (it populates `profile` in place from the existing
             // attribute) - only the Ext geometry handles need explicit re-seeding here, same root cause and fix
             // as the CreateFills/CreateLines Ext-geometry-preserve bug found via exhaustive testing.
-            if (ACAPI_Attribute_GetDefExt (API_ProfileID, profile.header.index, &sourceDefs) == NoError) {
-                hasSourceDefs = true;
+            const GSErrCode readError=ACAPI_Attribute_GetDefExt (API_ProfileID, profile.header.index, &sourceDefs);
+            if (readError!=NoError) {
+                attributeIds (CreateErrorResponse (readError,"Cannot preserve the existing profile geometry; no modification made."));
+                continue;
             }
+            hasSourceDefs = true;
         }
 
         profileData.Get ("wallType", profile.profile.wallType);
@@ -5156,49 +5644,68 @@ GS::ObjectState CreateProfilesCommand::Execute (const GS::ObjectState& parameter
 #endif
 
         GS::Array<GS::ObjectState> skinOverrides;
+        bool invalidOverride=false;
         if (profileData.Get ("skinOverrides", skinOverrides) && profileDefs.profile_vectorImageItems != nullptr) {
             for (const GS::ObjectState& skinOverride : skinOverrides) {
-                ApplyProfileSkinOverrides (*profileDefs.profile_vectorImageItems, skinOverride);
+                if (!ApplyProfileSkinOverrides (*profileDefs.profile_vectorImageItems, skinOverride)) { invalidOverride=true; break; }
             }
         }
 
+        if (invalidOverride || (!skinOverrides.IsEmpty () && profileDefs.profile_vectorImageItems==nullptr)) {
+            attributeIds (CreateErrorResponse (APIERR_BADPARS,"Unknown profile skin/edge, unsupported override or invalid resource reference; no profile written."));
+            continue;
+        }
+
 #ifdef ServerMainVers_2700
+        bool invalidSkin=false;
         if (!newSkins.IsEmpty () && profileDefs.profile_vectorImageItems != nullptr) {
             for (const GS::ObjectState& skinDef : newSkins) {
                 HatchObject hatch;
-                if (!BuildHatchFromSkinDefinition (skinDef, hatch)) {
-                    continue;
-                }
+                if (!BuildHatchFromSkinDefinition (skinDef, hatch)) { invalidSkin=true; break; }
                 Sy_HatchType hatchRef;
                 profileDefs.profile_vectorImageItems->AddHatch (hatchRef, hatch);
             }
         }
+        if (invalidSkin || (replaceSkins && newSkins.IsEmpty ())) {
+            attributeIds (CreateErrorResponse (APIERR_BADPARS,"Invalid new profile skin or empty replacement; no profile written."));
+            continue;
+        }
 #endif
+
+        if (doesExist && reuseMatching) {
+            API_AttributeDefExt previous={};
+            const GS::OnExit disposePrevious ([&] { ACAPI_DisposeAttrDefsHdlsExt (&previous); });
+            const auto readError=ACAPI_Attribute_GetDefExt (API_ProfileID,original.header.index,&previous);
+            if (readError!=NoError || previous.profile_vectorImageItems==nullptr || profileDefs.profile_vectorImageItems==nullptr) {
+                attributeIds (CreateErrorResponse (readError==NoError ? APIERR_GENERAL : readError,"Cannot compare native profile geometry; no profile written.")); continue;
+            }
+            const auto& a=original.profile; const auto& b=profile.profile;
+            bool matches=originalName==name && original.header.flags==profile.header.flags && a.wallType==b.wallType && a.beamType==b.beamType &&
+                a.coluType==b.coluType && a.handrailType==b.handrailType && a.otherGDLObjectType==b.otherGDLObjectType &&
+                *previous.profile_vectorImageItems==*profileDefs.profile_vectorImageItems;
+            const auto* previousNames=previous.profile_vectorImageParameterNames;
+            const auto* candidateNames=profileDefs.profile_vectorImageParameterNames;
+            // A null candidate table means preserve the existing modifier names, as in ModifyExt.
+            if (candidateNames!=nullptr) matches=matches && (previousNames!=nullptr ? *previousNames==*candidateNames : candidateNames->IsEmpty ());
+            if (!matches) { attributeIds (CreateErrorResponse (APIERR_ATTREXIST,"Existing native profile differs; ReuseIfMatching makes no changes.")); continue; }
+            attributeIds (CreateAttributeIdObjectState (profile.header.guid)); continue;
+        }
 
         if (doesExist) {
             GSErrCode err = ACAPI_Attribute_ModifyExt (&profile, &profileDefs);
             if (err != NoError) {
                 attributeIds (CreateErrorResponse (err, "Failed to modify."));
-                if (hasSourceDefs) {
-                    ACAPI_DisposeAttrDefsHdlsExt (&sourceDefs);
-                }
                 continue;
             }
         } else {
             GSErrCode err = ACAPI_Attribute_CreateExt (&profile, &profileDefs);
             if (err != NoError) {
                 attributeIds (CreateErrorResponse (err, "Failed to create."));
-                if (hasSourceDefs) {
-                    ACAPI_DisposeAttrDefsHdlsExt (&sourceDefs);
-                }
                 continue;
             }
         }
 
         attributeIds (CreateAttributeIdObjectState (profile.header.guid));
-        if (hasSourceDefs) {
-            ACAPI_DisposeAttrDefsHdlsExt (&sourceDefs);
-        }
     }
 
     return response;
@@ -5227,12 +5734,13 @@ GS::Optional<GS::UniString> CreateCompositesCommand::GetInputParametersSchema ()
                     "description": "Data to create a Composite.",
                     "properties": {
                         "attributeId": {
-                            "description": "Indentifier of the existing Composite to overwrite, ignored if overwriteExisting is false.",
+                            "description": "Identity of an existing composite for Overwrite or ReuseIfMatching; ignored in legacy Error mode.",
                             "$ref": "#/AttributeId"
                         },
                         "index": {
-                            "type": "string",
-                            "description": "Index of the existing Composite to overwrite, ignored if overwriteExisting is false."
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Index of an existing composite for Overwrite or ReuseIfMatching; ignored in legacy Error mode."
                         },
                         "name": {
                             "type": "string",
@@ -5240,22 +5748,28 @@ GS::Optional<GS::UniString> CreateCompositesCommand::GetInputParametersSchema ()
                         },
                         "useWith": {
                             "type": "array",
-                            "description" : "Array of types the composite can used with.",
+                            "description" : "Allowed element types. Omission preserves existing usage when overwriting; new composites require this field.",
+                            "minItems": 1,
+                            "uniqueItems": true,
                             "items": {
                                 "type": "string",
+                                "enum": ["Wall", "Slab", "Roof", "Shell"],
                                 "description": "Element type (Wall, Slab, Roof, or Shell)"
                             }
                         },
                         "skins": {
                             "type": "array",
                             "description" : "Array of skin data.",
+                            "minItems": 1,
+                            "maxItems": 32767,
                             "items" : {
                                 "type": "object",
                                 "description" : "Data to represent a skin.",
                                 "properties" : {
                                     "type": {
                                         "type": "string",
-                                        "description" : "Skin type (Core, Finish, or Other)"
+                                        "description" : "Skin type (Core, Finish, or Other)",
+                                        "enum": ["Core", "Finish", "Other"]
                                     },
                                     "buildingMaterialId" : {
                                         "$ref": "#/AttributeIdArrayItem"
@@ -5266,6 +5780,7 @@ GS::Optional<GS::UniString> CreateCompositesCommand::GetInputParametersSchema ()
                                     },
                                     "thickness" : {
                                         "type": "number",
+                                        "exclusiveMinimum": 0,
                                         "description" : "Skin thickness (in meters)."
                                     }
                                 },
@@ -5290,6 +5805,7 @@ GS::Optional<GS::UniString> CreateCompositesCommand::GetInputParametersSchema ()
                                     },
                                     "linePen" : {
                                         "type": "integer",
+                                        "minimum": 0, "maximum": 255,
                                             "description" : "Separator line pen index."
                                     }
                                 },
@@ -5309,6 +5825,11 @@ GS::Optional<GS::UniString> CreateCompositesCommand::GetInputParametersSchema ()
                     ]
                 }
             },
+            "ifExists": {
+                "type": "string",
+                "enum": ["Error", "Overwrite", "ReuseIfMatching"],
+                "description": "Explicit collision policy, mutually exclusive with overwriteExisting. ReuseIfMatching resolves by name or the supplied identity and compares name, usage, ordered skin materials/types/pens/thicknesses and separator lines/pens. Thickness tolerance is 1e-9 metres. A mismatch never overwrites."
+            },
             "overwriteExisting": {
                 "type": "boolean",
                 "description": "Overwrite the Composite if exists with the same name, or if index is given with the same index. The default is false."
@@ -5317,7 +5838,8 @@ GS::Optional<GS::UniString> CreateCompositesCommand::GetInputParametersSchema ()
         "additionalProperties": false,
         "required" : [
             "compositeDataArray"
-        ]
+        ],
+        "not": {"required": ["ifExists", "overwriteExisting"]}
     })SCHEMA";
 }
 
@@ -5345,6 +5867,14 @@ GS::ObjectState CreateCompositesCommand::Execute (const GS::ObjectState& paramet
     bool overwriteExisting = false;
     parameters.Get ("overwriteExisting", overwriteExisting);
 
+    GS::UniString collisionPolicy = overwriteExisting ? "Overwrite" : "Error";
+    parameters.Get ("ifExists", collisionPolicy);
+    if ((parameters.Contains ("ifExists") && parameters.Contains ("overwriteExisting")) ||
+        (collisionPolicy != "Error" && collisionPolicy != "Overwrite" && collisionPolicy != "ReuseIfMatching"))
+        return CreateErrorResponse (APIERR_BADPARS, "Supply one composite collision policy: Error, Overwrite, or ReuseIfMatching.");
+    overwriteExisting = collisionPolicy == "Overwrite";
+    const bool reuseMatching = collisionPolicy == "ReuseIfMatching";
+
     GS::ObjectState response;
     const auto& attributeIds = response.AddList<GS::ObjectState> ("attributeIds");
 
@@ -5354,21 +5884,38 @@ GS::ObjectState CreateCompositesCommand::Execute (const GS::ObjectState& paramet
         composite.header.typeID = API_CompWallID;
 
         GS::UniString name;
-        if (compositeData.Get ("name", name)) {
-            composite.header.uniStringNamePtr = &name;
+        if (!compositeData.Get ("name", name) || name.IsEmpty ()) {
+            attributeIds (CreateErrorResponse (APIERR_BADPARS, "Composite name must be nonempty.")); continue;
         }
+        composite.header.uniStringNamePtr = &name;
 
-        if (overwriteExisting) {
+        if (overwriteExisting || reuseMatching) {
+            if (compositeData.Contains ("attributeId") && compositeData.Contains ("index")) {
+                attributeIds (CreateErrorResponse (APIERR_BADPARS, "Use either attributeId or index to identify a composite, not both.")); continue;
+            }
             composite.header.guid = GetGuidFromAttributesArrayItem (compositeData);
+            if (compositeData.Contains ("attributeId") && composite.header.guid == APINULLGuid) {
+                attributeIds (CreateErrorResponse (APIERR_BADPARS, "Invalid composite attributeId.")); continue;
+            }
 
             Int32 index = -1;
-            if (compositeData.Get ("index", index) && index >= 0) {
+            if (compositeData.Contains ("index") && (!compositeData.Get ("index", index) || index < 1)) {
+                attributeIds (CreateErrorResponse (APIERR_BADPARS, "Composite index must be a positive integer.")); continue;
+            }
+            if (index > 0) {
                 composite.header.index = ACAPI_CreateAttributeIndex (index);
             }
         }
 
-        bool doesExist = (ACAPI_Attribute_Get (&composite) == NoError);
-        if (doesExist && !overwriteExisting) {
+        const bool explicitIdentity = (overwriteExisting || reuseMatching) && (compositeData.Contains ("attributeId") || compositeData.Contains ("index"));
+        const GSErrCode lookupError = ACAPI_Attribute_Get (&composite);
+        if (lookupError != NoError && (explicitIdentity || lookupError != APIERR_BADNAME)) {
+            attributeIds (CreateErrorResponse (lookupError, "Cannot resolve composite; lookup failure was not treated as permission to create.")); continue;
+        }
+        const bool doesExist = lookupError == NoError;
+        const API_Attribute existingComposite = composite;
+        const GS::UniString existingName = name;
+        if (doesExist && !overwriteExisting && !reuseMatching) {
             attributeIds (CreateErrorResponse (Error, "Composite already exists."));
             continue;
         }
@@ -5381,11 +5928,15 @@ GS::ObjectState CreateCompositesCommand::Execute (const GS::ObjectState& paramet
         }
 
         GS::Array<GS::UniString> useWith;
-        compositeData.Get ("useWith", useWith);
-        composite.header.flags &= ~APICWall_ForWall;
-        composite.header.flags &= ~APICWall_ForSlab;
-        composite.header.flags &= ~APICWall_ForRoof;
-        composite.header.flags &= ~APICWall_ForShell;
+        const bool hasUseWith = compositeData.Get ("useWith", useWith);
+        if ((!doesExist && !hasUseWith) || (hasUseWith && useWith.IsEmpty ())) {
+            attributeIds (CreateErrorResponse (APIERR_BADPARS, "New composites require nonempty useWith; omission on overwrite preserves existing usage."));
+            continue;
+        }
+        if (hasUseWith) {
+            composite.header.flags &= ~(APICWall_ForWall | APICWall_ForSlab | APICWall_ForRoof | APICWall_ForShell);
+        }
+        bool invalidUsage = false;
         for (const GS::UniString& useWithStr : useWith) {
             if (useWithStr == "Wall") {
                 composite.header.flags |= APICWall_ForWall;
@@ -5395,7 +5946,13 @@ GS::ObjectState CreateCompositesCommand::Execute (const GS::ObjectState& paramet
                 composite.header.flags |= APICWall_ForRoof;
             } else if (useWithStr == "Shell") {
                 composite.header.flags |= APICWall_ForShell;
+            } else {
+                invalidUsage = true;
             }
+        }
+        if (invalidUsage) {
+            attributeIds (CreateErrorResponse (APIERR_BADPARS, "Unknown composite useWith element type."));
+            continue;
         }
 
         GS::Array<GS::ObjectState> skins;
@@ -5404,8 +5961,8 @@ GS::ObjectState CreateCompositesCommand::Execute (const GS::ObjectState& paramet
         GS::Array<GS::ObjectState> separators;
         compositeData.Get ("separators", separators);
 
-        if (skins.IsEmpty ()) {
-            attributeIds (CreateErrorResponse (Error, "Skin array is empty."));
+        if (skins.IsEmpty () || skins.GetSize () > 32767) {
+            attributeIds (CreateErrorResponse (APIERR_BADPARS, "Skin count must be between 1 and 32767."));
             continue;
         }
         if (separators.GetSize () != skins.GetSize () + 1) {
@@ -5416,6 +5973,12 @@ GS::ObjectState CreateCompositesCommand::Execute (const GS::ObjectState& paramet
         UInt32 componentCount = skins.GetSize ();
         double totalThickness = 0.0;
         compositeDefs.cwall_compItems = (API_CWallComponent**) BMAllocateHandle (componentCount * sizeof (API_CWallComponent), ALLOCATE_CLEAR, 0);
+        if (compositeDefs.cwall_compItems == nullptr) {
+            attributeIds (CreateErrorResponse (APIERR_MEMFULL, "Cannot allocate composite skins."));
+            continue;
+        }
+        bool invalidSkin = false;
+        GSErrCode skinLookupError = NoError;
         for (UInt32 i = 0; i < componentCount; i++) {
             const GS::ObjectState& skinData = skins[i];
             API_CWallComponent& compData = (*compositeDefs.cwall_compItems)[i];
@@ -5426,24 +5989,47 @@ GS::ObjectState CreateCompositesCommand::Execute (const GS::ObjectState& paramet
                 compData.flagBits |= APICWallComp_Core;
             } else if (type == "Finish") {
                 compData.flagBits |= APICWallComp_Finish;
+            } else if (type != "Other") {
+                invalidSkin = true;
             }
 
             GS::ObjectState buildingMaterialId;
             skinData.Get ("buildingMaterialId", buildingMaterialId);
             API_AttributeIndex buildingMaterialIndex;
-            if (GetAttributeIndexFromAttributeId (buildingMaterialId, API_BuildingMaterialID, buildingMaterialIndex)) {
+            GSErrCode materialError = NoError;
+            if (GetAttributeIndexFromAttributeId (buildingMaterialId, API_BuildingMaterialID, buildingMaterialIndex, &materialError)) {
                 compData.buildingMaterial = buildingMaterialIndex;
+            } else {
+                invalidSkin = true;
+                if (skinLookupError == NoError) skinLookupError = materialError;
             }
 
-            skinData.Get ("framePen", compData.framePen);
-            skinData.Get ("thickness", compData.fillThick);
+            Int32 framePen = -1;
+            if (!skinData.Get ("framePen", framePen) || framePen < 0 || framePen > 255) invalidSkin = true;
+            else compData.framePen = static_cast<short> (framePen);
+            if (!skinData.Get ("thickness", compData.fillThick)) invalidSkin = true;
+            if (!std::isfinite (compData.fillThick) || compData.fillThick <= 0) {
+                invalidSkin = true;
+            }
             totalThickness += compData.fillThick;
+        }
+        if (invalidSkin || !std::isfinite (totalThickness)) {
+            attributeIds (CreateErrorResponse (skinLookupError != NoError ? skinLookupError : APIERR_BADPARS, "Invalid skin type, building material reference, pen or thickness; composite was not changed."));
+            ACAPI_DisposeAttrDefsHdlsExt (&compositeDefs);
+            continue;
         }
 
         composite.compWall.nComps = (short) componentCount;
         composite.compWall.totalThick = totalThickness;
 
         compositeDefs.cwall_compLItems = (API_CWallLineComponent**) BMAllocateHandle ((componentCount + 1) * sizeof (API_CWallLineComponent), ALLOCATE_CLEAR, 0);
+        if (compositeDefs.cwall_compLItems == nullptr) {
+            attributeIds (CreateErrorResponse (APIERR_MEMFULL, "Cannot allocate composite separators."));
+            ACAPI_DisposeAttrDefsHdlsExt (&compositeDefs);
+            continue;
+        }
+        bool invalidSeparator = false;
+        GSErrCode separatorLookupError = NoError;
         for (UInt32 i = 0; i < componentCount + 1; i++) {
             const GS::ObjectState& separatorData = separators[i];
             API_CWallLineComponent& lineData = (*compositeDefs.cwall_compLItems)[i];
@@ -5451,11 +6037,53 @@ GS::ObjectState CreateCompositesCommand::Execute (const GS::ObjectState& paramet
             GS::ObjectState lineTypeId;
             separatorData.Get ("lineTypeId", lineTypeId);
             API_AttributeIndex lineTypeIndex;
-            if (GetAttributeIndexFromAttributeId (lineTypeId, API_LinetypeID, lineTypeIndex)) {
+            GSErrCode lineError = NoError;
+            if (GetAttributeIndexFromAttributeId (lineTypeId, API_LinetypeID, lineTypeIndex, &lineError)) {
                 lineData.ltypeInd = lineTypeIndex;
+            } else {
+                invalidSeparator = true;
+                if (separatorLookupError == NoError) separatorLookupError = lineError;
             }
 
-            separatorData.Get ("linePen", lineData.linePen);
+            Int32 linePen = -1;
+            if (!separatorData.Get ("linePen", linePen) || linePen < 0 || linePen > 255) invalidSeparator = true;
+            else lineData.linePen = static_cast<short> (linePen);
+        }
+        if (invalidSeparator) {
+            attributeIds (CreateErrorResponse (separatorLookupError != NoError ? separatorLookupError : APIERR_BADPARS, "Invalid separator line type reference or pen; composite was not changed."));
+            ACAPI_DisposeAttrDefsHdlsExt (&compositeDefs);
+            continue;
+        }
+
+        if (doesExist && reuseMatching) {
+            API_AttributeDefExt existingDefs = {};
+            const GS::OnExit existingCleanup ([&] () { ACAPI_DisposeAttrDefsHdlsExt (&existingDefs); });
+            const GSErrCode readError = ACAPI_Attribute_GetDefExt (API_CompWallID, existingComposite.header.index, &existingDefs);
+            if (readError != NoError) {
+                attributeIds (CreateErrorResponse (readError, "Cannot read existing composite composition for reuse."));
+                ACAPI_DisposeAttrDefsHdlsExt (&compositeDefs); continue;
+            }
+            const auto usageMask = APICWall_ForWall | APICWall_ForSlab | APICWall_ForRoof | APICWall_ForShell;
+            bool matches = existingName == name && existingComposite.compWall.nComps == composite.compWall.nComps &&
+                (existingComposite.header.flags & usageMask) == (composite.header.flags & usageMask) &&
+                existingDefs.cwall_compItems != nullptr && existingDefs.cwall_compLItems != nullptr;
+            if (matches) {
+                for (UInt32 i = 0; i < componentCount; ++i) {
+                    const auto& a = (*existingDefs.cwall_compItems)[i];
+                    const auto& b = (*compositeDefs.cwall_compItems)[i];
+                    matches = matches && a.buildingMaterial == b.buildingMaterial && a.framePen == b.framePen &&
+                        a.flagBits == b.flagBits && std::isfinite (a.fillThick) && std::abs (a.fillThick - b.fillThick) <= 1e-9;
+                }
+                for (UInt32 i = 0; i <= componentCount; ++i) {
+                    const auto& a = (*existingDefs.cwall_compLItems)[i];
+                    const auto& b = (*compositeDefs.cwall_compLItems)[i];
+                    matches = matches && a.ltypeInd == b.ltypeInd && a.linePen == b.linePen;
+                }
+            }
+            if (matches) attributeIds (CreateAttributeIdObjectState (existingComposite.header.guid));
+            else attributeIds (CreateErrorResponse (APIERR_BADPARS, "Existing composite differs from the requested specification; it was not changed."));
+            ACAPI_DisposeAttrDefsHdlsExt (&compositeDefs);
+            continue;
         }
 
         if (doesExist) {

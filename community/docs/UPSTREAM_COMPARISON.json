@@ -1,0 +1,760 @@
+{
+  "recordedAt": "2026-09-19T14:09:39.502157+02:00",
+  "upstreamCommit": "ce033d6bdcc90b538b3c5f7ab62f676099b96823",
+  "originalFilesVerified": 73,
+  "scope": "Native cpp/hpp/json files; normalized text comparison. Commands are registered C++ classes, not verified runtime names.",
+  "notClaimed": [
+    "complete SDK field coverage",
+    "native behaviour",
+    "all changes are new capabilities"
+  ],
+  "originalCommandCount": 236,
+  "currentCommandCount": 279,
+  "addedCommands": [
+    {
+      "class": "CheckLibraryPartAncestryCommand",
+      "group": "libraryCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "CopyViewSettingsCommand",
+      "group": "navigatorCommands",
+      "introducedVersion": "1.5.8-ai.4"
+    },
+    {
+      "class": "CreateMasterLayoutsCommand",
+      "group": "navigatorCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "CreatePolygonalWallsCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "EditDimensionChainCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "EditSlabTopologyCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "ExecuteGuardedCommandCommand",
+      "group": "developerCommands",
+      "introducedVersion": "1.5.8-ai.4"
+    },
+    {
+      "class": "GetAnnotationDetailsCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "GetAnnotationFormattingCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.4"
+    },
+    {
+      "class": "GetAssemblySegmentsCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.4"
+    },
+    {
+      "class": "GetAutomationSessionCommand",
+      "group": "developerCommands",
+      "introducedVersion": "1.5.8-ai.4"
+    },
+    {
+      "class": "GetCommandContractsCommand",
+      "group": "developerCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "GetDimensionAnchorsCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.4"
+    },
+    {
+      "class": "GetDrawingFramesCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.4"
+    },
+    {
+      "class": "GetElementContextCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "GetElementHotspotsCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "GetLibraryPartParametersCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "GetLibraryPartPreviewCommand",
+      "group": "libraryCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "GetNativeComponentQuantitiesCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "GetNativeQuantitiesCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "GetNativeQuantityDefinitionsCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "GetOperationReceiptCommand",
+      "group": "developerCommands",
+      "introducedVersion": "1.5.8-ai.4"
+    },
+    {
+      "class": "GetPlanPrimitivesCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.4"
+    },
+    {
+      "class": "GetPolygonalWallGeometryCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "GetRoofGeometryCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.4"
+    },
+    {
+      "class": "GetSectionSettingsCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "GetSlabTopologyCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "GetWallReferenceGeometryCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.1"
+    },
+    {
+      "class": "ModifyDimensionSettingsCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "ModifyLabelsCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "ModifyPolygonalWallGeometryCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "ModifySectionSettingsCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "ModifyTextsCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "MoveSlabVerticesCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "OffsetSlabEdgeCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.4"
+    },
+    {
+      "class": "PositionDrawingsCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.4"
+    },
+    {
+      "class": "SearchLibraryPartsCommand",
+      "group": "libraryCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "SetAnnotationRunStylesCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.4"
+    },
+    {
+      "class": "SetAnnotationTextStyleCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "SetAssemblySegmentsCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.4"
+    },
+    {
+      "class": "SetElementRenovationStatusCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "StretchElementAtHotspotCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    },
+    {
+      "class": "TransformElementsCommand",
+      "group": "elementCommands",
+      "introducedVersion": "1.5.8-ai.3"
+    }
+  ],
+  "removedCommands": [],
+  "existingCommandCount": 236,
+  "changedLiteralInputContracts": [
+    {
+      "class": "ChangeDrawingLinkCommand",
+      "source": "archicad-addon/Sources/DocumentCreationCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateAssociativeDimensionsCommand",
+      "source": "archicad-addon/Sources/ExtendedElementCommands.cpp",
+      "addedPropertyPaths": [
+        "dimensionsData[].witnessPoints[].hotspot"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateBeamsCommand",
+      "source": "archicad-addon/Sources/ExtendedElementCommands.cpp",
+      "addedPropertyPaths": [
+        "beamsData[].beamShape",
+        "beamsData[].coverFill",
+        "beamsData[].cutFillBackgroundPen",
+        "beamsData[].cutFillPen",
+        "beamsData[].holes",
+        "beamsData[].holes[].centerX",
+        "beamsData[].holes[].centerZ",
+        "beamsData[].holes[].height",
+        "beamsData[].holes[].showContour",
+        "beamsData[].holes[].type",
+        "beamsData[].holes[].width",
+        "beamsData[].isFlipped"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateBuildingMaterialsCommand",
+      "source": "archicad-addon/Sources/AttributeCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateColumnsCommand",
+      "source": "archicad-addon/Sources/ElementCreationCommands.cpp",
+      "addedPropertyPaths": [
+        "columnsData[].coverFill",
+        "columnsData[].cutFillBackgroundPen",
+        "columnsData[].cutFillPen",
+        "columnsData[].isFlipped",
+        "columnsData[].isSlanted",
+        "columnsData[].relativeTopStory",
+        "columnsData[].slantAngle",
+        "columnsData[].slantDirectionAngle",
+        "columnsData[].topOffset",
+        "columnsData[].wrapping"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateCompositesCommand",
+      "source": "archicad-addon/Sources/AttributeCommands.cpp",
+      "addedPropertyPaths": [
+        "ifExists"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateDoorsCommand",
+      "source": "archicad-addon/Sources/ExtendedElementCommands.cpp",
+      "addedPropertyPaths": [
+        "doorsData[].libraryPart",
+        "doorsData[].libraryPart.guid",
+        "doorsData[].libraryPart.index",
+        "doorsData[].libraryPart.ownUnID",
+        "doorsData[].placement",
+        "doorsData[].placement.anchor",
+        "doorsData[].placement.distance",
+        "doorsData[].placement.from"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateDrawingsCommand",
+      "source": "archicad-addon/Sources/DocumentCreationCommands.cpp",
+      "addedPropertyPaths": [
+        "drawingsData[].angle",
+        "drawingsData[].modelOffset"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateFillsCommand",
+      "source": "archicad-addon/Sources/AttributeCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateLayerCombinationsCommand",
+      "source": "archicad-addon/Sources/AttributeCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateLayersCommand",
+      "source": "archicad-addon/Sources/AttributeCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateLayoutCommand",
+      "source": "archicad-addon/Sources/DocumentCreationCommands.cpp",
+      "addedPropertyPaths": [
+        "layoutsData[].createMissingMaster",
+        "layoutsData[].ifExists"
+      ],
+      "removedPropertyPaths": [
+        "layoutsData[].layoutParameters.bottomMargin",
+        "layoutsData[].layoutParameters.horizontalSize",
+        "layoutsData[].layoutParameters.leftMargin",
+        "layoutsData[].layoutParameters.rightMargin",
+        "layoutsData[].layoutParameters.topMargin",
+        "layoutsData[].layoutParameters.verticalSize"
+      ],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateLinesCommand",
+      "source": "archicad-addon/Sources/AttributeCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateMEPSystemsCommand",
+      "source": "archicad-addon/Sources/AttributeCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreatePenTablesCommand",
+      "source": "archicad-addon/Sources/AttributeCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateProfilesCommand",
+      "source": "archicad-addon/Sources/AttributeCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateRoofsCommand",
+      "source": "archicad-addon/Sources/ExtendedElementCommands.cpp",
+      "addedPropertyPaths": [
+        "roofsData[].positiveSide"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateSectionsCommand",
+      "source": "archicad-addon/Sources/ExtendedElementCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateSlabsCommand",
+      "source": "archicad-addon/Sources/ElementCreationCommands.cpp",
+      "addedPropertyPaths": [
+        "slabsData[].bottomMaterial",
+        "slabsData[].buildingMaterialId",
+        "slabsData[].compositeId",
+        "slabsData[].cutFillBackgroundPen",
+        "slabsData[].cutFillPen",
+        "slabsData[].floorFill",
+        "slabsData[].sideMaterial",
+        "slabsData[].structureType",
+        "slabsData[].topMaterial"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateSurfacesCommand",
+      "source": "archicad-addon/Sources/AttributeCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateViewMapFolderCommand",
+      "source": "archicad-addon/Sources/NavigatorCommands.cpp",
+      "addedPropertyPaths": [
+        "ifExists"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateViewsInViewMapCommand",
+      "source": "archicad-addon/Sources/NavigatorCommands.cpp",
+      "addedPropertyPaths": [
+        "viewsData[].ifExists",
+        "viewsData[].viewSettings"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateWallsCommand",
+      "source": "archicad-addon/Sources/ExtendedElementCommands.cpp",
+      "addedPropertyPaths": [
+        "wallsData[].cutFillBackgroundPen",
+        "wallsData[].cutFillPen",
+        "wallsData[].flipped",
+        "wallsData[].geometryType",
+        "wallsData[].isAutoOnStoryVisibility",
+        "wallsData[].junctionOrder",
+        "wallsData[].oppositeMaterial",
+        "wallsData[].profileType",
+        "wallsData[].referenceMaterial",
+        "wallsData[].sideMaterial",
+        "wallsData[].slantAlpha",
+        "wallsData[].slantBeta",
+        "wallsData[].thickness1",
+        "wallsData[].visibility",
+        "wallsData[].zoneRel"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateWindowsCommand",
+      "source": "archicad-addon/Sources/ExtendedElementCommands.cpp",
+      "addedPropertyPaths": [
+        "windowsData[].libraryPart",
+        "windowsData[].libraryPart.guid",
+        "windowsData[].libraryPart.index",
+        "windowsData[].libraryPart.ownUnID",
+        "windowsData[].placement",
+        "windowsData[].placement.anchor",
+        "windowsData[].placement.distance",
+        "windowsData[].placement.from"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "CreateZoneCategoriesCommand",
+      "source": "archicad-addon/Sources/AttributeCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "GetElementsOfGroupsCommand",
+      "source": "archicad-addon/Sources/ElementGroupingCommands.cpp",
+      "addedPropertyPaths": [
+        "recursive"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "GetRoomImageCommand",
+      "source": "archicad-addon/Sources/ElementCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "ModifyBeamsCommand",
+      "source": "archicad-addon/Sources/ExtendedElementCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "ModifyColumnsCommand",
+      "source": "archicad-addon/Sources/ExtendedElementCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "ModifyDoorsCommand",
+      "source": "archicad-addon/Sources/ExtendedElementCommands.cpp",
+      "addedPropertyPaths": [
+        "doorsWithDetails[].libraryPart",
+        "doorsWithDetails[].libraryPart.guid",
+        "doorsWithDetails[].libraryPart.index",
+        "doorsWithDetails[].libraryPart.ownUnID",
+        "doorsWithDetails[].parameterPolicy",
+        "doorsWithDetails[].placement",
+        "doorsWithDetails[].placement.anchor",
+        "doorsWithDetails[].placement.distance",
+        "doorsWithDetails[].placement.from"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "ModifyMorphsCommand",
+      "source": "archicad-addon/Sources/ExtendedElementCommands.cpp",
+      "addedPropertyPaths": [],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "ModifyRoofsCommand",
+      "source": "archicad-addon/Sources/ExtendedElementCommands.cpp",
+      "addedPropertyPaths": [
+        "roofsWithDetails[].angle",
+        "roofsWithDetails[].floorIndex",
+        "roofsWithDetails[].pivotLine",
+        "roofsWithDetails[].pivotLine.begCoordinate",
+        "roofsWithDetails[].pivotLine.endCoordinate",
+        "roofsWithDetails[].positiveSide"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "ModifyWallsCommand",
+      "source": "archicad-addon/Sources/ExtendedElementCommands.cpp",
+      "addedPropertyPaths": [
+        "wallsWithDetails[].flipped",
+        "wallsWithDetails[].junctionOrder",
+        "wallsWithDetails[].thickness1"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "ModifyWindowsCommand",
+      "source": "archicad-addon/Sources/ExtendedElementCommands.cpp",
+      "addedPropertyPaths": [
+        "windowsWithDetails[].libraryPart",
+        "windowsWithDetails[].libraryPart.guid",
+        "windowsWithDetails[].libraryPart.index",
+        "windowsWithDetails[].libraryPart.ownUnID",
+        "windowsWithDetails[].parameterPolicy",
+        "windowsWithDetails[].placement",
+        "windowsWithDetails[].placement.anchor",
+        "windowsWithDetails[].placement.distance",
+        "windowsWithDetails[].placement.from"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    },
+    {
+      "class": "SetLayoutSettingsCommand",
+      "source": "archicad-addon/Sources/DocumentCreationCommands.cpp",
+      "addedPropertyPaths": [
+        "layoutsData[].customDataMode"
+      ],
+      "removedPropertyPaths": [],
+      "note": "Full schema changed; paths do not cover enums, defaults, references, applicability or runtime behaviour."
+    }
+  ],
+  "inputContractsUsingDefaultSchemaInBoth": [
+    "CloseProjectCommand",
+    "GetAddOnVersionCommand",
+    "GetAllPropertiesCommand",
+    "GetArchicadLocationCommand",
+    "GetCalculationUnitsCommand",
+    "GetCurrentWindowTypeCommand",
+    "GetDesignOptionCombinationsCommand",
+    "GetDesignOptionSetsCommand",
+    "GetDesignOptionsCommand",
+    "GetDocumentRevisionsCommand",
+    "GetGeoLocationCommand",
+    "GetHotlinksCommand",
+    "GetIssuesCommand",
+    "GetKeynoteTreeCommand",
+    "GetLibrariesCommand",
+    "GetMEPDistributionSystemsCommand",
+    "GetModelViewOptionsCommand",
+    "GetProjectInfoCommand",
+    "GetProjectInfoFieldsCommand",
+    "GetRevisionChangesCommand",
+    "GetRevisionIssuesCommand",
+    "GetScriptUIResultCommand",
+    "GetSelectedElementsCommand",
+    "GetStoriesCommand",
+    "GetSuspendGroupsModeCommand",
+    "GetUserGSIDCommand",
+    "QuitArchicadCommand",
+    "ReloadLibrariesCommand",
+    "SaveProjectCommand",
+    "TeamworkReceiveCommand",
+    "TeamworkSendCommand"
+  ],
+  "inputContractsRequiringManualComparison": [
+    "CreateArcsCommand",
+    "CreateCirclesCommand",
+    "CreateLampsCommand",
+    "CreateLineElementsCommand",
+    "CreateObjectsCommand",
+    "CreateSplinesCommand",
+    "GetLayoutCustomSchemeCommand",
+    "ModifyLampsCommand",
+    "ModifyObjectsCommand"
+  ],
+  "addedFiles": [
+    "archicad-addon/Sources/AnnotationCommands.cpp",
+    "archicad-addon/Sources/AnnotationCommands.hpp",
+    "archicad-addon/Sources/AssemblySegmentCommands.cpp",
+    "archicad-addon/Sources/AssemblySegmentCommands.hpp",
+    "archicad-addon/Sources/DimensionAnchorCommands.cpp",
+    "archicad-addon/Sources/DimensionAnchorCommands.hpp",
+    "archicad-addon/Sources/DrawingPlacementCommands.cpp",
+    "archicad-addon/Sources/DrawingPlacementCommands.hpp",
+    "archicad-addon/Sources/DrawingPlacementGeometry.hpp",
+    "archicad-addon/Sources/GuardedExecutionCommands.cpp",
+    "archicad-addon/Sources/GuardedExecutionCommands.hpp",
+    "archicad-addon/Sources/NativeHotspotCommands.cpp",
+    "archicad-addon/Sources/NativeHotspotCommands.hpp",
+    "archicad-addon/Sources/NativeProjectCommands.cpp",
+    "archicad-addon/Sources/NativeProjectCommands.hpp",
+    "archicad-addon/Sources/NativeQuantityDefinitions.hpp",
+    "archicad-addon/Sources/PlanGeometryCommands.cpp",
+    "archicad-addon/Sources/PlanGeometryCommands.hpp",
+    "archicad-addon/Sources/PolygonalWallCommands.cpp",
+    "archicad-addon/Sources/PolygonalWallCommands.hpp",
+    "archicad-addon/Sources/SectionCommands.cpp",
+    "archicad-addon/Sources/SectionCommands.hpp",
+    "archicad-addon/Sources/SlabTopologyCommands.cpp",
+    "archicad-addon/Sources/SlabTopologyCommands.hpp",
+    "archicad-addon/Sources/TextRunCommands.cpp",
+    "archicad-addon/Sources/TextRunCommands.hpp",
+    "archicad-addon/Sources/TransformGeometry.hpp",
+    "archicad-addon/Sources/WallPlacementGeometry.hpp",
+    "archicad-addon/Sources/WallReferenceCommands.cpp",
+    "archicad-addon/Sources/WallReferenceCommands.hpp"
+  ],
+  "removedFiles": [],
+  "changedFiles": [
+    "archicad-addon/Sources/3DCutPlaneCommands.cpp",
+    "archicad-addon/Sources/AddOnMain.cpp",
+    "archicad-addon/Sources/AddOnVersion.hpp",
+    "archicad-addon/Sources/ApplicationCommands.cpp",
+    "archicad-addon/Sources/AttributeCommands.cpp",
+    "archicad-addon/Sources/AttributeCommands.hpp",
+    "archicad-addon/Sources/ClassificationCommands.cpp",
+    "archicad-addon/Sources/CommandBase.cpp",
+    "archicad-addon/Sources/CommandBase.hpp",
+    "archicad-addon/Sources/DesignOptionCommands.cpp",
+    "archicad-addon/Sources/DeveloperTools.cpp",
+    "archicad-addon/Sources/DeveloperTools.hpp",
+    "archicad-addon/Sources/DocumentCreationCommands.cpp",
+    "archicad-addon/Sources/DocumentCreationCommands.hpp",
+    "archicad-addon/Sources/ElementCommands.cpp",
+    "archicad-addon/Sources/ElementCommands.hpp",
+    "archicad-addon/Sources/ElementCreationCommands.cpp",
+    "archicad-addon/Sources/ElementGDLParameterCommands.cpp",
+    "archicad-addon/Sources/ElementGDLParameterCommands.hpp",
+    "archicad-addon/Sources/ElementGroupingCommands.cpp",
+    "archicad-addon/Sources/ExtendedElementCommands.cpp",
+    "archicad-addon/Sources/ExtendedElementCommands.hpp",
+    "archicad-addon/Sources/FavoritesCommands.cpp",
+    "archicad-addon/Sources/KeynoteCommands.cpp",
+    "archicad-addon/Sources/LibraryCommands.cpp",
+    "archicad-addon/Sources/LibraryCommands.hpp",
+    "archicad-addon/Sources/MEPCommands.cpp",
+    "archicad-addon/Sources/NavigatorCommands.cpp",
+    "archicad-addon/Sources/NavigatorCommands.hpp",
+    "archicad-addon/Sources/NotificationCommands.cpp",
+    "archicad-addon/Sources/ProjectCommands.cpp",
+    "archicad-addon/Sources/PropertyCommands.cpp",
+    "archicad-addon/Sources/RFIX/Images/CommonSchemaDefinitions.json",
+    "archicad-addon/Sources/SolidElementOperationCommands.cpp",
+    "archicad-addon/Sources/TeamworkCommands.cpp"
+  ],
+  "unchangedFiles": [
+    "archicad-addon/Sources/3DCutPlaneCommands.hpp",
+    "archicad-addon/Sources/AboutDialog.cpp",
+    "archicad-addon/Sources/AboutDialog.hpp",
+    "archicad-addon/Sources/ApplicationCommands.hpp",
+    "archicad-addon/Sources/ClassificationCommands.hpp",
+    "archicad-addon/Sources/Config.cpp",
+    "archicad-addon/Sources/Config.hpp",
+    "archicad-addon/Sources/DesignOptionCommands.hpp",
+    "archicad-addon/Sources/ElementCreationCommands.hpp",
+    "archicad-addon/Sources/ElementGroupingCommands.hpp",
+    "archicad-addon/Sources/FavoritesCommands.hpp",
+    "archicad-addon/Sources/IFCCommands.cpp",
+    "archicad-addon/Sources/IFCCommands.hpp",
+    "archicad-addon/Sources/IssueCommands.cpp",
+    "archicad-addon/Sources/IssueCommands.hpp",
+    "archicad-addon/Sources/KeynoteCommands.hpp",
+    "archicad-addon/Sources/MEPCommands.hpp",
+    "archicad-addon/Sources/MigrationHelper.hpp",
+    "archicad-addon/Sources/NotificationCommands.hpp",
+    "archicad-addon/Sources/ProjectCommands.hpp",
+    "archicad-addon/Sources/PropertyCommands.hpp",
+    "archicad-addon/Sources/ResourceIds.hpp",
+    "archicad-addon/Sources/RevisionCommands.cpp",
+    "archicad-addon/Sources/RevisionCommands.hpp",
+    "archicad-addon/Sources/SchemaDefinitions.cpp",
+    "archicad-addon/Sources/SchemaDefinitions.hpp",
+    "archicad-addon/Sources/ScriptUICommands.cpp",
+    "archicad-addon/Sources/ScriptUICommands.hpp",
+    "archicad-addon/Sources/ScriptUIPalette.cpp",
+    "archicad-addon/Sources/ScriptUIPalette.hpp",
+    "archicad-addon/Sources/SolidElementOperationCommands.hpp",
+    "archicad-addon/Sources/TapirPalette.cpp",
+    "archicad-addon/Sources/TapirPalette.hpp",
+    "archicad-addon/Sources/TeamworkCommands.hpp",
+    "archicad-addon/Sources/UvManager.cpp",
+    "archicad-addon/Sources/UvManager.hpp",
+    "archicad-addon/Sources/VersionChecker.cpp",
+    "archicad-addon/Sources/VersionChecker.hpp"
+  ]
+}

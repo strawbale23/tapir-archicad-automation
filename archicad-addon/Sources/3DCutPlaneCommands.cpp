@@ -11,7 +11,7 @@ GS::String Set3DCutPlanesCommand::GetName () const
 // there is no 3DCutPlane scheme definition.
 // I am not sure if it is needed, because it will not occur in other commands
 Set3DCutPlanesCommand::Set3DCutPlanesCommand () :
-    CommandBase (CommonSchema::NotUsed)
+    CommandBase (CommonSchema::Used)
 {}
 
 

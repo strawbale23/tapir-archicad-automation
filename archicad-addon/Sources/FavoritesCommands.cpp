@@ -243,7 +243,7 @@ GS::ObjectState ApplyFavoritesToElementDefaultsCommand::Execute (const GS::Objec
     favorite.classifications.New ();
     favorite.elemCategoryValues.New ();
 
-    ACAPI_CallUndoableCommand ("ApplyFavoritesToElementDefaults", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("ApplyFavoritesToElementDefaults", [&]() -> GSErrCode {
         for (const GS::UniString& favoriteName : favorites) {
             favorite.name = favoriteName;
 
@@ -276,6 +276,7 @@ GS::ObjectState ApplyFavoritesToElementDefaultsCommand::Execute (const GS::Objec
 
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 }
@@ -344,53 +345,6 @@ GS::Optional<GS::UniString> CreateFavoritesFromElementsCommand::GetRawResponseSc
     })";
 }
 
-// GDL parameter names are case insensitive, but API_AddParType::name keeps the spelling the
-// library part declared, so fold to lower case before comparing. `lowerCaseName` must already
-// be lower case.
-static bool IsGDLParameterNamed (const char* paramName, const char* lowerCaseName)
-{
-    UIndex ii = 0;
-    for (; paramName[ii] != '\0' && lowerCaseName[ii] != '\0'; ++ii) {
-        const char ch = (paramName[ii] >= 'A' && paramName[ii] <= 'Z')
-            ? char (paramName[ii] - 'A' + 'a')
-            : paramName[ii];
-        if (ch != lowerCaseName[ii]) {
-            return false;
-        }
-    }
-    return paramName[ii] == '\0' && lowerCaseName[ii] == '\0';
-}
-
-// Some standard library window parts - the Hungarian "ablak" family (parentUnID A7D46BBD)
-// among them - are dual-use GDL parts that both the Window tool and the Corner Window tool
-// place. For those, ACAPI_Element_Get reports header.variationID as the corner window
-// variation even for an element that was placed as an ordinary window, and handing that header
-// to ACAPI_Favorite_Create/_Change files the new Favorite under the Corner Window section of
-// the Favorites palette instead of the Window section.
-// The part's own AC_CW_Function GDL parameter is the reliable signal: it stays 0 while the
-// element is not acting as a corner window. Only then is the variation reset, and only to
-// APIVarId_Generic - which is what a window placed with the Window tool carries anyway, so
-// this is a no-op for every window whose header was already correct, and for every part that
-// does not have the parameter at all.
-static void ResetCornerWindowVariationIfNotCornerWindow (API_Elem_Head& header, const API_ElementMemo& memo)
-{
-    if (GetElemTypeId (header) != API_WindowID || memo.params == nullptr) {
-        return;
-    }
-
-    const GSSize nParams = BMGetHandleSize ((GSHandle) memo.params) / sizeof (API_AddParType);
-    for (GSIndex ii = 0; ii < nParams; ++ii) {
-        const API_AddParType& actParam = (*memo.params)[ii];
-        if (actParam.typeMod != API_ParSimple || !IsGDLParameterNamed (actParam.name, "ac_cw_function")) {
-            continue;
-        }
-        if (actParam.value.real == 0.0) {
-            SetElemVariationId (header, APIVarId_Generic);
-        }
-        return;
-    }
-}
-
 // Fills in favorite.element/classifications/properties/memo by reading them off an existing
 // element - shared by CreateFavoritesFromElements (-> ACAPI_Favorite_Create, a new entry) and
 // UpdateFavoritesFromElements (-> ACAPI_Favorite_Change, re-capturing an existing entry in place).
@@ -432,8 +386,6 @@ static GS::Optional<GS::ObjectState> BuildFavoriteFromElement (const API_Guid& e
         return CreateFailedExecutionResult (err, "Failed to get details of the element");
     }
 
-    ResetCornerWindowVariationIfNotCornerWindow (favorite.element.header, favorite.memo.Get ());
-
     return {};
 }
 
@@ -453,7 +405,7 @@ GS::ObjectState CreateFavoritesFromElementsCommand::Execute (const GS::ObjectSta
     favorite.subElements.New ();
     favorite.folder.New ();
 
-    ACAPI_CallUndoableCommand ("CreateFavoritesFromElements", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("CreateFavoritesFromElements", [&]() -> GSErrCode {
         for (const GS::ObjectState& favoriteFromElement : favoritesFromElements) {
             favoriteFromElement.Get ("favorite", favorite.name);
 
@@ -483,6 +435,7 @@ GS::ObjectState CreateFavoritesFromElementsCommand::Execute (const GS::ObjectSta
 
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 }
@@ -680,37 +633,11 @@ GS::ObjectState ExportFavoritesCommand::Execute (const GS::ObjectState& paramete
 // ApplyFavoritesToElements — the real-element counterpart of
 // ApplyFavoritesToElementDefaults (see above): same four calls, each swapped for
 // its real-element equivalent (ACAPI_Element_ChangeParameters instead of
-// ChangeDefaults - settings-only, keeps the target's own geometry (see
-// MemoCarriesGeometry below) and its guid,
+// ChangeDefaults - settings-only, never touches geometry or the element's guid,
 // ACAPI_Element_AddClassificationItem instead of the TAPIR_..._Default helper,
 // TAPIR_Element_SetCategoryValue instead of TAPIR_Element_SetCategoryValueDefault,
 // ACAPI_Element_SetProperties instead of TAPIR_Element_SetPropertiesOfDefaultElem).
 // ============================================================================
-
-// A Favorite's memo is captured from a real, placed element - see
-// BuildFavoriteFromElement above, which fills it with ACAPI_Element_GetMemo, and the
-// same holds for the Favorites that ship in Archicad's own templates. For the
-// hierarchical element types that memo therefore also carries the source element's
-// geometry: API_ElementMemo::stairBaseLine for a Stair - the very handle
-// CreateStairsCommand::SetTypeSpecificParameters fills in to place one - and the
-// sub-element arrays for a Railing or a Curtain Wall. Handing that memo to
-// ACAPI_Element_ChangeParameters re-places the target element on the Favorite's own
-// baseline instead of leaving it where it was, which is what made applying a stair
-// Favorite scatter the placed stairs across the project (#576).
-// For these types the memo is withheld, so only the settings that live in the
-// API_Element struct are applied. The settings that live in the memo's sub-elements (a
-// Stair's structure, treads and risers, a Railing's posts) are left untouched too -
-// that is the price of the fix, and it is the safe half of the trade-off: an element
-// that keeps some of its own settings is recoverable, one that has moved is not.
-static bool MemoCarriesGeometry (const API_Elem_Head& header)
-{
-    switch (GetElemTypeId (header)) {
-        case API_StairID:
-        case API_RailingID:
-        case API_CurtainWallID: return true;
-        default:                return false;
-    }
-}
 
 ApplyFavoritesToElementsCommand::ApplyFavoritesToElementsCommand () :
     CommandBase (CommonSchema::Used)
@@ -749,7 +676,7 @@ GS::Optional<GS::UniString> ApplyFavoritesToElementsCommand::GetInputParametersS
             },
             "applySettings": {
                 "type": "boolean",
-                "description": "Whether to apply the Favorite's settings-type parameters (structure, materials, pens, etc. - never geometry). For the hierarchical types (Stair, Railing, Curtain Wall) the settings of the sub-elements are not applied, because they are inseparable from the Favorite's own geometry. Default is true."
+                "description": "Whether to apply the Favorite's settings-type parameters (structure, materials, pens, etc. - never geometry). Default is true."
             },
             "applyClassifications": {
                 "type": "boolean",
@@ -804,7 +731,7 @@ GS::ObjectState ApplyFavoritesToElementsCommand::Execute (const GS::ObjectState&
     GS::ObjectState response;
     const auto& executionResults = response.AddList<GS::ObjectState> ("executionResults");
 
-    ACAPI_CallUndoableCommand ("ApplyFavoritesToElements", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("ApplyFavoritesToElements", [&]() -> GSErrCode {
         for (const GS::ObjectState& item : favoritesToApply) {
             const GS::ObjectState* elementId = item.Get ("elementId");
             if (elementId == nullptr) {
@@ -835,13 +762,18 @@ GS::ObjectState ApplyFavoritesToElementsCommand::Execute (const GS::ObjectState&
                 continue;
             }
 
-            // Compare the type ID only - never the whole API_ElemType. On AC26+ that struct
-            // also carries the variationID, and a Window favorite can legitimately hold a
-            // different variation than the window it is applied to (dual-use library parts
-            // report APIVarId_CornerWindow even when placed as regular windows), which made
-            // every Window favorite look like a type mismatch. The same guard elsewhere
-            // (see ExtendedElementCommands.cpp) compares the type ID for this reason.
-            const bool typeMatches = GetElemTypeId (favorite.element.header) == GetElemTypeId (targetElement.header);
+#ifdef ServerMainVers_2600
+            // Deliberately typeID only, not the full API_ElemType (which also carries
+            // variationID - a structural sub-variant like Wall profile type, not something
+            // that should gate "is this favorite applicable to this kind of element" for
+            // ordinary types). Comparing the full struct rejected every real favorite tested
+            // live against a plain Object, including favorites GetFavoritesByType itself
+            // (via ACAPI_Favorite_GetNum, the same type filter Archicad's own UI uses)
+            // returned for that exact type.
+            const bool typeMatches = favorite.element.header.type.typeID == targetElement.header.type.typeID;
+#else
+            const bool typeMatches = favorite.element.header.typeID == targetElement.header.typeID;
+#endif
             if (!typeMatches) {
                 executionResults (CreateFailedExecutionResult (APIERR_BADID, "The Favorite's element type does not match the target element's type."));
                 ACAPI_DisposeElemMemoHdls (&favorite.memo.Get ());
@@ -849,10 +781,9 @@ GS::ObjectState ApplyFavoritesToElementsCommand::Execute (const GS::ObjectState&
             }
 
             // ACAPI_Element_ChangeParameters (unlike ACAPI_Element_Change) only ever touches
-            // settings-type parameters of the API_Element itself, never its geometry, and
-            // always keeps the target's own guid - exactly the "apply favorite settings"
-            // semantics we want here. The memo is the one part that can carry geometry, so
-            // it is withheld for the types where it does (see MemoCarriesGeometry above).
+            // settings-type parameters, never geometry, and always keeps the target's own
+            // guid - exactly the "apply favorite settings" semantics we want here, with no
+            // risk of moving the element or losing its identity.
             if (applySettings) {
                 API_Element mask = {};
                 ACAPI_ELEMENT_MASK_SETFULL (mask);
@@ -860,32 +791,40 @@ GS::ObjectState ApplyFavoritesToElementsCommand::Execute (const GS::ObjectState&
                 GS::Array<API_Guid> targetGuids;
                 targetGuids.Push (targetGuid);
 
-                const API_ElementMemo* memoToApply = MemoCarriesGeometry (targetElement.header)
-                    ? nullptr
-                    : favorite.memo.GetPtr ();
-
-                err = ACAPI_Element_ChangeParameters (targetGuids, &favorite.element, memoToApply, &mask);
+                err = ACAPI_Element_ChangeParameters (targetGuids, &favorite.element, favorite.memo.GetPtr (), &mask);
             }
             ACAPI_DisposeElemMemoHdls (&favorite.memo.Get ());
             if (err != NoError) {
-                executionResults (CreateFailedExecutionResult (err, "Failed to apply favorite to element"));
+                executionResults (CreateFailedExecutionResult (err, DescribeElementChangeFailure (err, "Failed to apply favorite to element.")));
                 continue;
             }
 
+            GSErrCode applyErr = NoError;
+            const char* applyErrStage = nullptr;
+
             if (applyClassifications) {
                 for (const GS::Pair<API_Guid, API_Guid>& pair : *favorite.classifications) {
-                    ACAPI_Element_AddClassificationItem (targetGuid, pair.second);
+                    const GSErrCode classErr = ACAPI_Element_AddClassificationItem (targetGuid, pair.second);
+                    if (classErr != NoError && applyErr == NoError) { applyErr = classErr; applyErrStage = "classifications"; }
                 }
             }
 
             if (applyCategories) {
                 for (const API_ElemCategoryValue& categoryValue : *favorite.elemCategoryValues) {
-                    TAPIR_Element_SetCategoryValue (targetGuid, categoryValue);
+                    const GSErrCode catErr = TAPIR_Element_SetCategoryValue (targetGuid, categoryValue);
+                    if (catErr != NoError && applyErr == NoError) { applyErr = catErr; applyErrStage = "element categories"; }
                 }
             }
 
             if (applyProperties) {
-                ACAPI_Element_SetProperties (targetGuid, *favorite.properties);
+                const GSErrCode propErr = ACAPI_Element_SetProperties (targetGuid, *favorite.properties);
+                if (propErr != NoError && applyErr == NoError) { applyErr = propErr; applyErrStage = "properties"; }
+            }
+
+            if (applyErr != NoError) {
+                executionResults (CreateFailedExecutionResult (applyErr,
+                    GS::UniString ("Favorite settings/geometry were applied, but its ") + applyErrStage + " could not be fully applied."));
+                continue;
             }
 
             executionResults (CreateSuccessfulExecutionResult ());
@@ -893,6 +832,7 @@ GS::ObjectState ApplyFavoritesToElementsCommand::Execute (const GS::ObjectState&
 
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 }
@@ -978,7 +918,7 @@ GS::ObjectState UpdateFavoritesFromElementsCommand::Execute (const GS::ObjectSta
     favorite.elemCategoryValues.New ();
     favorite.subElements.New ();
 
-    ACAPI_CallUndoableCommand ("UpdateFavoritesFromElements", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("UpdateFavoritesFromElements", [&]() -> GSErrCode {
         for (const GS::ObjectState& favoriteFromElement : favoritesFromElements) {
             favoriteFromElement.Get ("favorite", favorite.name);
 
@@ -1000,6 +940,7 @@ GS::ObjectState UpdateFavoritesFromElementsCommand::Execute (const GS::ObjectSta
 
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 }
@@ -1066,7 +1007,7 @@ GS::ObjectState RenameFavoritesCommand::Execute (const GS::ObjectState& paramete
     GS::ObjectState response;
     const auto& executionResults = response.AddList<GS::ObjectState> ("executionResults");
 
-    ACAPI_CallUndoableCommand ("RenameFavorites", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("RenameFavorites", [&]() -> GSErrCode {
         for (const GS::ObjectState& rename : renames) {
             GS::UniString oldName;
             GS::UniString newName;
@@ -1079,6 +1020,7 @@ GS::ObjectState RenameFavoritesCommand::Execute (const GS::ObjectState& paramete
 
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 }
@@ -1131,7 +1073,7 @@ GS::ObjectState DeleteFavoritesCommand::Execute (const GS::ObjectState& paramete
     GS::ObjectState response;
     const auto& executionResults = response.AddList<GS::ObjectState> ("executionResults");
 
-    ACAPI_CallUndoableCommand ("DeleteFavorites", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("DeleteFavorites", [&]() -> GSErrCode {
         for (const GS::UniString& favoriteName : favorites) {
             const GSErrCode err = ACAPI_Favorite_Delete (favoriteName);
             executionResults (err == NoError ? CreateSuccessfulExecutionResult () : CreateFailedExecutionResult (err, "Failed to delete favorite"));
@@ -1139,6 +1081,7 @@ GS::ObjectState DeleteFavoritesCommand::Execute (const GS::ObjectState& paramete
 
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 }

@@ -1,10 +1,73 @@
 #include "DeveloperTools.hpp"
 
 #include "SchemaDefinitions.hpp"
+#include "AddOnVersion.hpp"
 
 #include "File.hpp"
 
 static std::vector<CommandGroup> gCommandGroups;
+
+GS::Optional<GS::UniString> GetCommandContractsCommand::GetInputParametersSchema () const
+{
+    return R"({"type":"object","properties":{
+        "commandName":{"type":"string","description":"Optional exact native command name."},
+        "offset":{"type":"integer","minimum":0},
+        "limit":{"type":"integer","minimum":1,"maximum":100},
+        "includeSchemas":{"type":"boolean"}
+    },"additionalProperties":false})";
+}
+
+GS::Optional<GS::UniString> GetCommandContractsCommand::GetRawResponseSchema () const
+{
+    return R"({"type":"object","properties":{
+        "contractVersion":{"type":"integer"},"addOnVersion":{"type":"string"},
+        "commands":{"type":"array","items":{"type":"object","properties":{
+            "name":{"type":"string"},"group":{"type":"string"},
+            "description":{"type":"string"},"introducedVersion":{"type":"string"},
+            "inputSchemaJson":{"type":"string"},"outputSchemaJson":{"type":"string"}
+        },"required":["name","group","description","introducedVersion"],"additionalProperties":false}},
+        "commonSchemaJson":{"type":"string"},"total":{"type":"integer"},
+        "nextOffset":{"type":"integer"},"hasMore":{"type":"boolean"}
+    },"required":["contractVersion","addOnVersion","commands","total","nextOffset","hasMore"],"additionalProperties":false})";
+}
+
+GS::ObjectState GetCommandContractsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const
+{
+    GS::UniString name;
+    parameters.Get ("commandName", name);
+    Int32 offset = 0, limit = 25;
+    bool includeSchemas = false;
+    parameters.Get ("offset", offset);
+    parameters.Get ("limit", limit);
+    parameters.Get ("includeSchemas", includeSchemas);
+    if (offset < 0 || limit < 1 || limit > 100)
+        return CreateErrorResponse (APIERR_BADPARS, "offset must be nonnegative and limit between 1 and 100.");
+    GS::ObjectState result ("contractVersion", 1, "addOnVersion", ADDON_VERSION);
+    const auto& add = result.AddList<GS::ObjectState> ("commands");
+    Int32 total = 0, returned = 0;
+    for (const CommandGroup& group : gCommandGroups) {
+        for (const CommandInfo& command : group.commands) {
+            if (!name.IsEmpty () && command.name != name) continue;
+            const Int32 index = total++;
+            if (index < offset || returned >= limit) continue;
+            GS::ObjectState entry ("name", command.name, "group", group.name,
+                "description", command.description, "introducedVersion", command.version);
+            if (includeSchemas) {
+                entry.Add ("inputSchemaJson", command.inputScheme.HasValue () ? command.inputScheme.Get () : GS::UniString ("null"));
+                entry.Add ("outputSchemaJson", command.outputScheme.HasValue () ? command.outputScheme.Get () : GS::UniString ("null"));
+            }
+            add (entry);
+            ++returned;
+        }
+    }
+    if (!name.IsEmpty () && total == 0)
+        return CreateErrorResponse (APIERR_BADPARS, "No registered native command with the requested name.");
+    result.Add ("total", total);
+    result.Add ("nextOffset", offset + returned);
+    result.Add ("hasMore", offset + returned < total);
+    if (includeSchemas) result.Add ("commonSchemaJson", GetCommonSchemaDefinitions ());
+    return result;
+}
 
 static bool WriteStringToFile (const IO::Location& location, const GS::UniString& content)
 {

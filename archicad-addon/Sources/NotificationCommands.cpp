@@ -89,7 +89,7 @@ void AddElementNotificationClientCommand::Client::Send(HTTP::Client::Request& re
 }
 
 AddElementNotificationClientCommand::AddElementNotificationClientCommand () :
-    CommandBase (CommonSchema::NotUsed)
+    CommandBase (CommonSchema::Used)
 {
 }
 
@@ -353,7 +353,7 @@ AddElementNotificationClientCommand::ElementReservationChangeHandler (
 }
 
 RemoveElementNotificationClientCommand::RemoveElementNotificationClientCommand () :
-    CommandBase (CommonSchema::NotUsed)
+    CommandBase (CommonSchema::Used)
 {
 }
 

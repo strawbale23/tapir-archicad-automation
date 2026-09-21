@@ -669,7 +669,7 @@ GS::ObjectState CreateMEPRoutingElementsCommand::Execute (const GS::ObjectState&
     GS::ObjectState response;
     const auto& elements = response.AddList<GS::ObjectState> ("elements");
 
-    ACAPI_CallUndoableCommand ("Create MEP Routing Elements", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("Create MEP Routing Elements", [&]() -> GSErrCode {
         for (const GS::ObjectState& routingElementData : routingElementsData) {
             GS::UniString domainStr;
             routingElementData.Get ("domain", domainStr);
@@ -746,6 +746,7 @@ GS::ObjectState CreateMEPRoutingElementsCommand::Execute (const GS::ObjectState&
         }
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 #else
@@ -838,7 +839,7 @@ GS::ObjectState CreateMEPElementsCommand::Execute (const GS::ObjectState& parame
     GS::ObjectState response;
     const auto& elements = response.AddList<GS::ObjectState> ("elements");
 
-    ACAPI_CallUndoableCommand ("Create MEP Elements", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("Create MEP Elements", [&]() -> GSErrCode {
         for (const GS::ObjectState& elementData : elementsData) {
             GS::UniString typeStr;
             elementData.Get ("type", typeStr);
@@ -909,6 +910,7 @@ GS::ObjectState CreateMEPElementsCommand::Execute (const GS::ObjectState& parame
         }
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 #else

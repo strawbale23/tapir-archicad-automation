@@ -1,3 +1,5 @@
+#include "PolygonalWallCommands.hpp"
+#include "SectionCommands.hpp"
 #include "APIEnvir.h"
 #include "ACAPinc.h"
 
@@ -21,9 +23,20 @@
 #include "ScriptUICommands.hpp"
 #include "ProjectCommands.hpp"
 #include "ElementCommands.hpp"
+#include "SlabTopologyCommands.hpp"
+#include "AnnotationCommands.hpp"
+#include "NativeProjectCommands.hpp"
 #include "ElementGDLParameterCommands.hpp"
 #include "ElementCreationCommands.hpp"
 #include "ExtendedElementCommands.hpp"
+#include "WallReferenceCommands.hpp"
+#include "NativeHotspotCommands.hpp"
+#include "AssemblySegmentCommands.hpp"
+#include "DimensionAnchorCommands.hpp"
+#include "TextRunCommands.hpp"
+#include "DrawingPlacementCommands.hpp"
+#include "GuardedExecutionCommands.hpp"
+#include "PlanGeometryCommands.hpp"
 #include "ElementGroupingCommands.hpp"
 #include "AttributeCommands.hpp"
 #include "TeamworkCommands.hpp"
@@ -47,18 +60,19 @@ template <typename CommandType>
 GSErrCode RegisterCommand (CommandGroup& group, const GS::UniString& version, const GS::UniString& description)
 {
     GS::Owner<CommandType> command = GS::NewOwned<CommandType> ();
-    group.commands.push_back (CommandInfo (
+    CommandInfo info (
         command->GetName (),
         description,
         version,
         command->GetInputParametersSchema (),
-        command->GetRawResponseSchema ())
-    );
+        command->GetDocumentedResponseSchema ());
 
     GSErrCode err = ACAPI_AddOnAddOnCommunication_InstallAddOnCommandHandler (command.Pass ());
     if (err != NoError) {
         return err;
     }
+    group.commands.push_back (info);
+    RegisterGuardedNativeCommand (CommandType ().GetName (),[] () { return std::unique_ptr<CommandBase> (new CommandType ()); });
     return NoError;
 }
 
@@ -183,10 +197,6 @@ GSErrCode Initialize (void)
             applicationCommands, "0.1.0",
             "Performs a quit operation on the currently running Archicad instance."
         );
-        err |= RegisterCommand<GetPointFromUserCommand> (
-            applicationCommands, "1.5.9",
-            "Asks the designer to click a point in the current window and returns it. Archicad waits for the click or for Escape, and every other JSON command queues behind this one until then; the call fails when the input is cancelled."
-        );
         err |= RegisterCommand<GetCurrentWindowTypeCommand> (
             applicationCommands, "1.0.7",
             "Returns the type of the current (active) window."
@@ -241,29 +251,9 @@ GSErrCode Initialize (void)
             projectCommands, "1.1.5",
             "Sets the story sructure of the currently loaded project."
         );
-        err |= RegisterCommand<GetAutoTextKeysCommand> (
-            projectCommands, "1.5.9",
-            "Retrieves the available autotext keys (name and embeddable key), optionally for a specific element. Embed a key in a Text or Label content by surrounding it with '<' and '>'."
-        );
-        err |= RegisterCommand<GetAutoTextNameCommand> (
-            projectCommands, "1.5.9",
-            "Retrieves the display names of one or more autotext keys (as returned inside a '<...>' embedded key), with a direct guid lookup for property-based keys instead of enumerating every property definition."
-        );
         err |= RegisterCommand<GetHotlinksCommand> (
             projectCommands, "0.1.0",
             "Gets the file system locations (path) of the hotlink modules. The hotlinks can have tree hierarchy in the project."
-        );
-        err |= RegisterCommand<CreateHotlinkNodesCommand> (
-            projectCommands, "1.5.9",
-            "Creates hotlink module nodes from source files. A node that already points at the same file is returned instead of duplicated (Archicad 26 and later; 25 cannot see an unplaced node)."
-        );
-        err |= RegisterCommand<CreateHotlinkInstancesCommand> (
-            projectCommands, "1.5.9",
-            "Places instances of hotlink module nodes at an origin, rotation and mirroring."
-        );
-        err |= RegisterCommand<ChangeHotlinkInstancesCommand> (
-            projectCommands, "1.5.9",
-            "Moves, rotates or mirrors placed hotlink instances by changing their transformation. MoveElements and RotateElements do not work on hotlink instances."
         );
         err |= RegisterCommand<OpenProjectCommand> (
             projectCommands, "1.0.7",
@@ -276,14 +266,6 @@ GSErrCode Initialize (void)
         err |= RegisterCommand<SaveProjectCommand> (
             projectCommands, "1.3.1",
             "Saves the currently opened project."
-        );
-        err |= RegisterCommand<SaveAsModuleFileCommand> (
-            projectCommands, "1.5.9",
-            "Saves the given elements, or the current selection, as a hotlink module (.mod) file."
-        );
-        err |= RegisterCommand<SaveProjectAsArchiveCommand> (
-            projectCommands, "1.5.10",
-            "Saves the open project as an archive (.pla) file, with the library parts it uses inside."
         );
         err |= RegisterCommand<GetCalculationUnitsCommand> (
             projectCommands, "1.4.0",
@@ -318,6 +300,97 @@ GSErrCode Initialize (void)
             elementCommands, "1.0.7",
             "Returns the identifier of every element of the given type on the plan. It works for any type. Use the optional filter parameter for filtering."
         );
+        err |= RegisterCommand<GetSlabTopologyCommand> (
+            elementCommands, "1.5.8-ai.3",
+            "Reads slab contours, holes, arc sweeps, outgoing edge trims/surfaces and native vertex identifiers without duplicating the contour closing vertex."
+        );
+        err |= RegisterCommand<EditSlabTopologyCommand> (
+            elementCommands, "1.5.8-ai.3", "Insert/delete slab vertices or holes, split straight/curved edges, and merge compatible adjoining edges using native polygon edits and explicit geometry/revision checks.");
+        err |= RegisterCommand<MoveSlabVerticesCommand> (
+            elementCommands, "1.5.8-ai.3",
+            "Moves selected slab contour vertices in place, checking expected coordinates and optional native IDs. Preserves unedited polygon data; geometric acceptance still needs verification."
+        );
+        err |= RegisterCommand<OffsetSlabEdgeCommand> (
+            elementCommands, "1.5.8-ai.4", "Offset one straight slab edge in metres while retaining neighbouring edge lines and native slab identity. Requires the observed revision and an explicit endpoint movement bound.");
+        err |= RegisterCommand<SetSlabEdgeSettingsCommand> (
+            elementCommands, "1.5.8-ai.4", "Edit individual slab edge trims and surface overrides with revision checking, preserving other edges and slab identity.");
+        err |= RegisterCommand<SetSlabEdgeArcCommand> (
+            elementCommands, "1.5.8-ai.4", "Curve or straighten one native slab contour edge using a signed arc sweep, retaining endpoints and checking the observed slab revision and polygon readback.");
+        err |= RegisterCommand<GetNativeQuantityDefinitionsCommand> (
+            elementCommands, "1.5.8-ai.3", "Discover supported native quantities, SDK fields and units without calculating model quantities.");
+        err |= RegisterCommand<GetNativeComponentQuantitiesCommand> (
+            elementCommands, "1.5.8-ai.3", "Read native construction component volumes, projected areas, building materials and sub-element identities.");
+        err |= RegisterCommand<ModifySectionSettingsCommand> (
+            elementCommands, "1.5.8-ai.3", "Edit section/elevation geometry, range and selected display settings while retaining linked markers.");
+        err |= RegisterCommand<GetSectionSettingsCommand> (
+            elementCommands, "1.5.8-ai.3", "Read section/elevation cut and depth lines, ranges and display settings.");
+        err |= RegisterCommand<GetPolygonalWallGeometryCommand> (
+            elementCommands, "1.5.8-ai.3", "Read polygonal wall footprint, native reference edge and revision stamp.");
+        err |= RegisterCommand<ModifyPolygonalWallGeometryCommand> (
+            elementCommands, "1.5.8-ai.3", "Replace a polygonal wall footprint in place with revision protection; retain non-geometric settings.");
+        err |= RegisterCommand<CreatePolygonalWallsCommand> (
+            elementCommands, "1.5.8-ai.3", "Create native Basic polygonal walls from straight-edged contours. Polygonal walls do not host doors/windows.");
+        err |= RegisterCommand<GetNativeQuantitiesCommand> (
+            elementCommands, "1.5.8-ai.3",
+            "Calculates native quantities for supported architectural element families, with explicit units and the wall opening-area subtraction threshold."
+        );
+        err |= RegisterCommand<SetElementRenovationStatusCommand> (
+            elementCommands, "1.5.8-ai.3",
+            "Sets the native element renovation role and reads it back. Does not change a view's renovation filter."
+        );
+        err |= RegisterCommand<GetRenovationFiltersCommand> (
+            elementCommands, "1.5.8-ai.4",
+            "Lists the project's renovation filters and reports which one is currently active."
+        );
+        err |= RegisterCommand<SetActiveRenovationFilterCommand> (
+            elementCommands, "1.5.8-ai.4",
+            "Sets the active renovation filter for the current window and reads it back."
+        );
+        err |= RegisterCommand<GetElementContextCommand> (
+            elementCommands, "1.5.8-ai.3",
+            "Reads bounded pages of native elements in the current database, with type, story and layer filters and optional details. Restart paging after edits."
+        );
+        err |= RegisterCommand<FindDuplicateElementsCommand> (
+            elementCommands, "1.5.8-ai.4",
+            "Finds elements of the same type stacked on or very near each other (same native bounding-box center and size within tolerance) - a common modelling mistake from copy-paste or import. Groups results; does not delete anything."
+        );
+        err |= RegisterCommand<ExplainElementCommand> (
+            elementCommands, "1.5.8-ai.4",
+            "Combines an element's details, native quantities and relations - and optionally classifications/properties - into one call, instead of several separate ones, for building context before deciding what to do with an element."
+        );
+        err |= RegisterCommand<GetPlanPrimitivesCommand> (
+            elementCommands, "1.5.8-ai.4", "Reads bounded native line/arc/polyline/text geometry with database and element provenance for plan interpretation. Does not convert PDFs or infer walls."
+        );
+        err |= RegisterCommand<GetRoofGeometryCommand> (
+            elementCommands, "1.5.8-ai.4", "Reads single-plane roof contour and slope or multi-plane pivot polygon with native construction settings."
+        );
+        err |= RegisterCommand<GetDrawingFramesCommand> (
+            elementCommands, "1.5.8-ai.4", "Reads drawing frame bounds in layout paper millimetres, excluding drawing titles."
+        );
+        err |= RegisterCommand<PositionDrawingTitlesCommand> (
+            elementCommands, "1.5.8-ai.4", "Position an existing drawing title by its observed native title hotspot in paper millimetres, checking that the drawing frame stays fixed. Supports dry run.");
+        err |= RegisterCommand<PositionDrawingsCommand> (
+            elementCommands, "1.5.8-ai.4", "Plans or applies native drawing translations using frame anchors and paper coordinates, with native frame readback."
+        );
+        err |= RegisterCommand<GetAnnotationFormattingCommand> (
+            elementCommands, "1.5.8-ai.4", "Reads paged native paragraph/run formatting for text and textual labels."
+        );
+        err |= RegisterCommand<SetAnnotationRunStylesCommand> (
+            elementCommands, "1.5.8-ai.4", "Changes selected native text runs with stale-revision checks and formatting readback while retaining content and ranges."
+        );
+        err |= RegisterCommand<GetDimensionAnchorsCommand> (
+            elementCommands, "1.5.8-ai.4", "Discovers supported native floor-plan dimension anchors with coordinates and revision-guarded witness descriptors for associative creation and editing."
+        );
+        err |= RegisterCommand<GetAssemblySegmentsCommand> (
+            elementCommands, "1.5.8-ai.4", "Reads native beam/column segments, taper dimensions, length schemes and cuts. Lengths in metres; angles in radians."
+        );
+        err |= RegisterCommand<SetAssemblySegmentsCommand> (
+            elementCommands, "1.5.8-ai.4", "Replaces a beam/column segment assembly with revision checks, explicit inheritance, native identity retention and settings readback."
+        );
+        err |= RegisterCommand<GetElementHotspotsCommand> (
+            elementCommands, "1.5.8-ai.3", "Read paged native hotspot coordinates and selection descriptors, with database and element revision context.");
+        err |= RegisterCommand<StretchElementAtHotspotCommand> (
+            elementCommands, "1.5.8-ai.3", "Stretch an ungrouped element at an observed native hotspot, with stale-context guards and coordinate readback. Native hotspot/type support applies.");
         err |= RegisterCommand<GetAllElementsCommand> (
             elementCommands, "1.0.7",
             "Returns the identifier of all elements on the plan. Use the optional filter parameter for filtering."
@@ -330,9 +403,13 @@ GSErrCode Initialize (void)
             elementCommands, "1.0.7",
             "Tests an elements by the given criterias."
         );
+        err |= RegisterCommand<GetWallReferenceGeometryCommand> (
+            elementCommands, "1.5.8-ai.1",
+            "Gets straight wall reference-line geometry in project XY metres for measuring and placing openings. Does not infer finished room faces."
+        );
         err |= RegisterCommand<GetDetailsOfElementsCommand> (
             elementCommands, "1.5.7",
-            "Gets the details of the given elements (geometry parameters etc). Use the optional fields parameter to return only the fields you need and skip the computation of the others (for example floorPlanPolygons)."
+            "Gets the details of the given elements (geometry parameters etc)."
         );
         err |= RegisterCommand<SetDetailsOfElementsCommand> (
             elementCommands, "1.0.7",
@@ -360,7 +437,7 @@ GSErrCode Initialize (void)
         );
         err |= RegisterCommand<GetZoneBoundariesCommand> (
             elementCommands, "1.2.3",
-            "Gets the boundaries of the given Zones (connected elements, neighbour zones, etc.). Accepts either a single zoneElementId or a list of zones. Prefer the list: the expensive boundary recalculation runs once per call, so querying many Zones in one call is much faster than calling the command once per Zone."
+            "Gets the boundaries of the given Zone (connected elements, neighbour zones, etc.)."
         );
         err |= RegisterCommand<UpdateZonesCommand> (
             elementCommands, "1.5.4",
@@ -378,6 +455,10 @@ GSErrCode Initialize (void)
             elementCommands, "1.0.2",
             "Moves elements with a given vector."
         );
+        err |= RegisterCommand<TransformElementsCommand> (
+            elementCommands, "1.5.8-ai.3",
+            "Moves, rotates, mirrors or resizes explicit ungrouped elements through native editing; supports copying and returns native result IDs. Execution acceptance requires subsequent model verification."
+        );
         err |= RegisterCommand<RotateElementsCommand> (
             elementCommands, "1.5.3",
             "Rotates elements around a reference point."
@@ -394,6 +475,8 @@ GSErrCode Initialize (void)
             elementCommands, "1.5.2",
             "Unlocks the given elements. Manual lock, not teamwork!"
         );
+        err |= RegisterCommand<GetLibraryPartParametersCommand> (
+            elementCommands, "1.5.8-ai.3", "Inspect evaluated parameters of a loaded library part before placement, using index plus inventory GUID.");
         err |= RegisterCommand<GetGDLParametersOfElementsCommand> (
             elementCommands, "1.5.7",
             "Gets all the GDL parameters (name, type, value) of the given elements."
@@ -448,11 +531,17 @@ GSErrCode Initialize (void)
         );
         err |= RegisterCommand<CreateAssociativeDimensionsOnSectionCommand> (
             elementCommands, "1.4.0",
-            "Creates associative linear dimensions on section elements using common wall, slab, beam, column and opening presets. The preset points of multiple section elements can be merged into one continuous dimension chain via sectionElementIds."
+            "Creates associative linear dimensions on section elements using common wall, slab, beam, column and opening presets."
         );
         err |= RegisterCommand<CreateWallThicknessDimensionsCommand> (
             elementCommands, "1.4.0",
             "Creates associative wall thickness dimensions for the given walls."
+        );
+        err |= RegisterCommand<EditDimensionChainCommand> (
+            elementCommands, "1.5.8-ai.3", "Retain/remove dimension witnesses and add native associations using a modification-stamp guard; native geometry determines order.");
+        err |= RegisterCommand<ModifyDimensionSettingsCommand> (
+            elementCommands, "1.5.8-ai.3",
+            "Edits a 2D dimension's reference point, direction, line pen and horizontal text setting without replacing its existing witness associations."
         );
         err |= RegisterCommand<GetDimensionDataCommand> (
             elementCommands, "1.5.0",
@@ -506,6 +595,20 @@ GSErrCode Initialize (void)
             elementCommands, "1.2.5",
             "Creates Label elements based on the given parameters."
         );
+        err |= RegisterCommand<GetAnnotationDetailsCommand> (
+            elementCommands, "1.5.8-ai.3",
+            "Reads native text and label contents and placement in bounded batches, with explicit text-box and coordinate units. Symbolic labels remain identified as symbolic."
+        );
+        err |= RegisterCommand<SetAnnotationTextStyleCommand> (
+            elementCommands, "1.5.8-ai.3", "Apply selected style fields uniformly to text and text-label paragraphs while retaining content and unedited formatting.");
+        err |= RegisterCommand<ModifyTextsCommand> (
+            elementCommands, "1.5.8-ai.3",
+            "Edits native text contents, position, rotation and wrapping in place. Uses Archicad text editing; does not replace the element."
+        );
+        err |= RegisterCommand<ModifyLabelsCommand> (
+            elementCommands, "1.5.8-ai.3",
+            "Edits native text-label contents and label leader geometry in place; symbolic label content requires GDL parameter operations."
+        );
         err |= RegisterCommand<CreateTextsCommand> (
             elementCommands, "1.5.0",
             "Creates standalone Text elements based on the given parameters."
@@ -553,14 +656,6 @@ GSErrCode Initialize (void)
         err |= RegisterCommand<ModifyLampsCommand> (
             elementCommands, "1.5.7",
             "Modifies Lamp elements based on the given parameters."
-        );
-        err |= RegisterCommand<ModifyTextsCommand> (
-            elementCommands, "1.5.9",
-            "Modifies standalone Text elements based on the given parameters."
-        );
-        err |= RegisterCommand<ModifyLabelsCommand> (
-            elementCommands, "1.5.9",
-            "Modifies Label elements based on the given parameters."
         );
         err |= RegisterCommand<GetElementPreviewImageCommand> (
             elementCommands, "1.2.7",
@@ -636,9 +731,7 @@ GSErrCode Initialize (void)
             favoritesCommands, "1.5.4",
             "Apply the given favorites to existing elements. Only settings-type parameters are changed - "
             "geometry (position, floor, and dimensions such as a Wall's height) is left untouched, so applying "
-            "a Favorite never moves or resizes the target element. For the hierarchical types (Stair, "
-            "Railing, Curtain Wall) the settings of the sub-elements are not applied, because they are "
-            "inseparable from the Favorite's own geometry. By default settings, classifications, "
+            "a Favorite never moves or resizes the target element. By default settings, classifications, "
             "categories and properties are all applied; each can be opted out of individually."
         );
         err |= RegisterCommand<UpdateFavoritesFromElementsCommand> (
@@ -680,7 +773,7 @@ GSErrCode Initialize (void)
         );
         err |= RegisterCommand<CreatePropertyGroupsCommand> (
             propertyCommands, "1.0.7",
-            "Creates Property Groups based on the given parameters."
+            "Creates custom property groups, or explicitly reuses matching groups or updates their descriptions."
         );
         err |= RegisterCommand<DeletePropertyGroupsCommand> (
             propertyCommands, "1.0.9",
@@ -688,7 +781,7 @@ GSErrCode Initialize (void)
         );
         err |= RegisterCommand<CreatePropertyDefinitionsCommand> (
             propertyCommands, "1.0.9",
-            "Creates Custom Property Definitions based on the given parameters."
+            "Creates custom property definitions with typed defaults, or explicitly reuses matching definitions."
         );
         err |= RegisterCommand<DeletePropertyDefinitionsCommand> (
             propertyCommands, "1.0.9",
@@ -696,7 +789,7 @@ GSErrCode Initialize (void)
         );
         err |= RegisterCommand<UpdatePropertyDefinitionsCommand> (
             propertyCommands, "1.5.4",
-            "Updates existing Custom Property Definitions: the expression(s) of an expression-based property, or the possible enum values of an enumeration property."
+            "Edits custom property names, descriptions, classification availability, editability and typed or expression defaults in place."
         );
         AddCommandGroup (propertyCommands);
     }
@@ -840,11 +933,7 @@ GSErrCode Initialize (void)
         CommandGroup ifcCommands ("IFC Commands");
         err |= RegisterCommand<IFCFileOperationCommand> (
             ifcCommands, "1.2.6",
-            "Executes an IFC file operation: opens or merges an IFC file, or saves the project as an IFC file. A save can name the export translator to use."
-        );
-        err |= RegisterCommand<GetIFCExportTranslatorsCommand> (
-            ifcCommands, "1.5.10",
-            "Lists the IFC export translators of the project, the preview translator first. Pass one of the names to IFCFileOperation as translatorName."
+            "Executes an IFC file operation."
         );
         err |= RegisterCommand<GetElementsByIFCIdsCommand> (
             ifcCommands, "1.5.1",
@@ -879,18 +968,18 @@ GSErrCode Initialize (void)
             libraryCommands, "1.2.2",
             "Adds the given files into the embedded library."
         );
-        err |= RegisterCommand<SetLibrariesCommand> (
-            libraryCommands, "1.5.9",
-            "Makes the given folders the project's local libraries; built-in, embedded, server and web libraries are kept. Set the libraries before opening a file that needs them and the missing-library dialog does not appear."
-        );
-        err |= RegisterCommand<AddLibrariesCommand> (
-            libraryCommands, "1.5.9",
-            "Adds the given folders to the project's local libraries, skipping any already loaded."
+        err |= RegisterCommand<CheckLibraryPartAncestryCommand> (
+            libraryCommands, "1.5.8-ai.3", "Check native ancestry between two identified loaded library parts. Ancestry does not prove host placement compatibility.");
+        err |= RegisterCommand<SearchLibraryPartsCommand> (
+            libraryCommands, "1.5.8-ai.3",
+            "Searches target-project library parts in bounded pages, exposing identity, parent subtype and placeability. Restart paging after library reload."
         );
         err |= RegisterCommand<GetAvailableLibraryPartsCommand> (
             libraryCommands, "1.5.0",
             "Lists library parts currently available to the project. Filter by typeId (e.g. 'Door', 'Window', 'Object', 'Lamp')."
         );
+        err |= RegisterCommand<GetLibraryPartPreviewCommand> (
+            libraryCommands, "1.5.8-ai.3", "Read the bounded embedded preview of an identified target-project library part without placing it. This is a saved thumbnail, not a parameterized model rendering.");
         AddCommandGroup (libraryCommands);
     }
 
@@ -941,6 +1030,10 @@ GSErrCode Initialize (void)
             navigatorCommands, "1.4.0",
             "Creates Layouts and their backing master layouts."
         );
+        err |= RegisterCommand<CreateMasterLayoutsCommand> (
+            navigatorCommands, "1.5.8-ai.3",
+            "Creates master layouts with explicit millimetre paper geometry, or reuses an exact matching named master. Reports retained IDs on incomplete setup."
+        );
         err |= RegisterCommand<CreateLayoutSubsetCommand> (
             navigatorCommands, "1.4.0",
             "Creates Layout Book subsets."
@@ -979,6 +1072,9 @@ GSErrCode Initialize (void)
         err |= RegisterCommand<SetViewSettingsCommand> (
             navigatorCommands, "1.1.4",
             "Sets the view settings of navigator items"
+        );
+        err |= RegisterCommand<CopyViewSettingsCommand> (
+            navigatorCommands, "1.5.8-ai.4", "Copies selected saved settings from a template view, retaining native custom model options, layer states, dimensions and pens. View identities and source links remain unchanged; per-target results are not an atomic batch."
         );
         err |= RegisterCommand<GetView2DTransformationsCommand> (
             navigatorCommands, "1.1.7",
@@ -1250,18 +1346,6 @@ GSErrCode Initialize (void)
             solidElementOperationCommands, "1.5.4",
             "Returns solid element operation links for each queried element, grouped by role (target or operator)."
         );
-        err |= RegisterCommand<TrimElementsCommand> (
-            solidElementOperationCommands, "1.5.9",
-            "Trims construction elements with a roof or shell: the roofs and shells in the list, or one given trimming element with a trim type."
-        );
-        err |= RegisterCommand<RemoveElementTrimsCommand> (
-            solidElementOperationCommands, "1.5.9",
-            "Removes the trim between an element and the roof or shell trimming it."
-        );
-        err |= RegisterCommand<GetElementTrimsCommand> (
-            solidElementOperationCommands, "1.5.9",
-            "Which roofs and shells trim each queried element, with the trim type, and which elements it trims."
-        );
         AddCommandGroup (solidElementOperationCommands);
     }
 
@@ -1280,6 +1364,22 @@ GSErrCode Initialize (void)
 
     { // Developer Commands
         CommandGroup developerCommands ("Developer Commands");
+        // Failure leaves guarded execution disabled and is visible in session discovery.
+        // It must not prevent the original native command catalogue from loading.
+        InitializeAutomationSession ();
+        err |= RegisterCommand<GetAutomationSessionCommand> (
+            developerCommands, "1.5.8-ai.4", "Reports native project/database session targeting and available guarded commands."
+        );
+        err |= RegisterCommand<ExecuteGuardedCommandCommand> (
+            developerCommands, "1.5.8-ai.4", "Executes a supported native command with project/session guards and a bounded same-session operation receipt; repeated identical operation IDs return the prior result without another write."
+        );
+        err |= RegisterCommand<GetOperationReceiptCommand> (
+            developerCommands, "1.5.8-ai.4", "Retrieves a historical same-session operation receipt. Receipts do not prove current model state after Undo and do not survive project closure or add-on unload."
+        );
+        err |= RegisterCommand<GetCommandContractsCommand> (
+            developerCommands, "1.5.8-ai.3",
+            "Returns paginated contracts from the commands actually registered in this add-on. Optional schemas are JSON strings; shared definitions are included."
+        );
         err |= RegisterCommand<GenerateDocumentationCommand> (
             developerCommands, "1.0.7",
             "Generates files for the documentation. Used by Tapir developers only."

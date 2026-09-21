@@ -79,7 +79,7 @@ GS::ObjectState CreateGroupsCommand::Execute(const GS::ObjectState& parameters, 
 
 #ifdef ServerMainVers_2600
 
-    ACAPI_CallUndoableCommand("Create Element Groups", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand("Create Element Groups", [&]() -> GSErrCode {
         for (const GS::ObjectState& groupParam : elementGroups) {
 
             GS::Array<GS::ObjectState> elements;
@@ -123,6 +123,7 @@ GS::ObjectState CreateGroupsCommand::Execute(const GS::ObjectState& parameters, 
         }
         return NoError;
         });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 #else
     GS::UniString notSupportedMsg = "The Create Groups command is not supported in Archicad 25 or older.";
     groupGuids (CreateErrorResponse (APIERR_NOTSUPPORTED, notSupportedMsg));
@@ -227,6 +228,7 @@ GS::Optional<GS::UniString> GetElementsOfGroupsCommand::GetInputParametersSchema
     return R"({
         "type": "object",
         "properties": {
+            "recursive": {"type":"boolean","default":false,"description":"Include the complete group subtree using native GetAllGroupedElems."},
             "groups": {
                 "type": "array",
                 "description": "The groups to get the elements of.",
@@ -269,6 +271,8 @@ GS::ObjectState GetElementsOfGroupsCommand::Execute(const GS::ObjectState& param
         return CreateErrorResponse(APIERR_BADPARS, "Invalid or missing 'groups' parameter.");
     }
 
+    bool recursive = false;
+    parameters.Get ("recursive", recursive);
     GS::ObjectState response;
     const auto& elementsOfGroups = response.AddList<GS::ObjectState>("elementsOfGroups");
 
@@ -280,7 +284,9 @@ GS::ObjectState GetElementsOfGroupsCommand::Execute(const GS::ObjectState& param
         }
 
         GS::Array<API_Guid> elemGuids;
-        const GSErrCode err = ACAPI_Grouping_GetGroupedElems(GetGuidFromObjectState(*groupId), &elemGuids);
+        const GSErrCode err = recursive
+            ? ACAPI_Grouping_GetAllGroupedElems (GetGuidFromObjectState (*groupId), &elemGuids)
+            : ACAPI_Grouping_GetGroupedElems (GetGuidFromObjectState (*groupId), &elemGuids);
         if (err != NoError) {
             elementsOfGroups(CreateErrorResponse(err, "Failed to get the elements of the group."));
             continue;

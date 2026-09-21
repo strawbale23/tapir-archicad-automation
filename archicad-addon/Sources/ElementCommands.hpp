@@ -2,6 +2,46 @@
 
 #include "CommandBase.hpp"
 
+class TransformElementsCommand : public CommandBase
+{
+public:
+    TransformElementsCommand () : CommandBase (CommonSchema::Used) {}
+    GS::String GetName () const override { return "TransformElements"; }
+    GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    GS::Optional<GS::UniString> GetRawResponseSchema () const override;
+    GS::ObjectState Execute (const GS::ObjectState&, GS::ProcessControl&) const override;
+};
+
+class GetElementContextCommand : public CommandBase
+{
+public:
+    GetElementContextCommand () : CommandBase (CommonSchema::Used) {}
+    GS::String GetName () const override { return "GetElementContext"; }
+    GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    GS::Optional<GS::UniString> GetRawResponseSchema () const override;
+    GS::ObjectState Execute (const GS::ObjectState&, GS::ProcessControl&) const override;
+};
+
+class FindDuplicateElementsCommand : public CommandBase
+{
+public:
+    FindDuplicateElementsCommand () : CommandBase (CommonSchema::Used) {}
+    GS::String GetName () const override { return "FindDuplicateElements"; }
+    GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    GS::Optional<GS::UniString> GetRawResponseSchema () const override;
+    GS::ObjectState Execute (const GS::ObjectState&, GS::ProcessControl&) const override;
+};
+
+class ExplainElementCommand : public CommandBase
+{
+public:
+    ExplainElementCommand () : CommandBase (CommonSchema::Used) {}
+    GS::String GetName () const override { return "ExplainElement"; }
+    GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    GS::Optional<GS::UniString> GetRawResponseSchema () const override;
+    GS::ObjectState Execute (const GS::ObjectState&, GS::ProcessControl&) const override;
+};
+
 class GetElementsByTypeCommand : public CommandBase
 {
 public:
@@ -227,4 +267,3 @@ public:
     virtual GS::Optional<GS::UniString> GetRawResponseSchema () const override;
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
-

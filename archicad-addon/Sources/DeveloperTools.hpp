@@ -42,3 +42,13 @@ public:
 };
 
 void AddCommandGroup (const CommandGroup& commandGroup);
+
+class GetCommandContractsCommand : public CommandBase
+{
+public:
+    GetCommandContractsCommand () : CommandBase (CommonSchema::Used) {}
+    GS::String GetName () const override { return "GetCommandContracts"; }
+    GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    GS::Optional<GS::UniString> GetRawResponseSchema () const override;
+    GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const override;
+};

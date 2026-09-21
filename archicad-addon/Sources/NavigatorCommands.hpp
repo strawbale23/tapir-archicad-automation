@@ -156,6 +156,15 @@ public:
     GetNavigatorItemTreeCommand ();
     virtual GS::String GetName () const override;
     virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
-    virtual GS::Optional<GS::UniString> GetRawResponseSchema () const override;
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
+class CopyViewSettingsCommand : public CommandBase
+{
+public:
+    CopyViewSettingsCommand () : CommandBase (CommonSchema::Used) {}
+    GS::String GetName () const override { return "CopyViewSettings"; }
+    GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    GS::Optional<GS::UniString> GetRawResponseSchema () const override;
+    GS::ObjectState Execute (const GS::ObjectState&, GS::ProcessControl&) const override;
 };

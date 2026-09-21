@@ -230,6 +230,9 @@ public:
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
 
+GS::Optional<GS::UniString> ConfigureSlabForCreation (API_Element& element, const GS::ObjectState& parameters, const Stories& stories);
+GSErrCode ConfigureColumnForCreation (API_Element& element, API_ElementMemo& memo, const GS::ObjectState& details, const Stories& stories);
+
 class ModifyMeshesCommand : public CommandBase
 {
 public:

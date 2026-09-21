@@ -22,6 +22,16 @@ public:
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
 
+class CreateMasterLayoutsCommand : public CommandBase
+{
+public:
+    CreateMasterLayoutsCommand () : CommandBase (CommonSchema::Used) {}
+    GS::String GetName () const override { return "CreateMasterLayouts"; }
+    GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    GS::Optional<GS::UniString> GetRawResponseSchema () const override;
+    GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const override;
+};
+
 class CreateLayoutCommand : public CommandBase
 {
 public:

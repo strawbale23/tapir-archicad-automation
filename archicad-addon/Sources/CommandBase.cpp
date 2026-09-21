@@ -3,8 +3,6 @@
 #include "SchemaDefinitions.hpp"
 #include "MigrationHelper.hpp"
 
-#include <cmath>
-
 constexpr double EPS = 0.001;
 constexpr const char* CommandNamespace = "TapirCommand";
 
@@ -54,6 +52,16 @@ GS::Optional<GS::UniString> CommandBase::GetRawResponseSchema () const
     return {};
 }
 
+GS::Optional<GS::UniString> CommandBase::GetDocumentedResponseSchema () const
+{
+    const auto raw = GetRawResponseSchema ();
+    if (!raw.HasValue ()) return {};
+    // SDK/native transaction errors are command-level responses, even when
+    // the normal result is a batch. Keep them in the discoverable contract.
+    return GS::UniString ("{\"anyOf\":[") + raw.Get () +
+        R"(,{"type":"object","properties":{"error":{"type":"object","properties":{"code":{"type":"integer"},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false}},"required":["error"],"additionalProperties":false}]})";
+}
+
 // Deliberately empty - see the comment on the declaration. The schema the command
 // declares is documented, not handed to Archicad's response validation.
 GS::Optional<GS::UniString> CommandBase::GetResponseSchema () const
@@ -65,7 +73,7 @@ GS::ObjectState CreateErrorResponse (GSErrCode errorCode, const GS::UniString& e
 {
     GS::ObjectState error;
     error.Add ("code", errorCode);
-    error.Add ("message", errorMessage.ToCStr ().Get ());
+    error.Add ("message", errorMessage.ToCStr (CC_UTF8).Get ());
     return GS::ObjectState ("error", error);
 }
 
@@ -76,17 +84,31 @@ GS::ObjectState CreateFailedExecutionResult (GSErrCode errorCode, const GS::UniS
     return error;
 }
 
-GS::ObjectState CreateFailedExecutionResult (const GS::ObjectState& errorResponse)
-{
-    GS::ObjectState result = errorResponse;
-    result.Add ("success", false);
-    return result;
-}
-
 GS::ObjectState CreateSuccessfulExecutionResult ()
 {
     return GS::ObjectState (
         "success", true);
+}
+
+GS::UniString DescribeElementChangeFailure (GSErrCode errorCode, const GS::UniString& baseMessage)
+{
+    // Deliberately narrow: only codes that mean "this specific, fixable thing about the
+    // element or the project state is blocking the edit", not a general Archicad error
+    // translator. Never auto-corrects any of these (unlike a hidden default layer at
+    // creation time, which is the add-on's own choice) - these reflect state the user or
+    // project set up on purpose, so the caller must decide what to do about it.
+    switch (errorCode) {
+        case APIERR_HIDDENLAY:
+            return baseMessage + " The element's layer is hidden; Archicad refuses to change elements on a hidden layer via the API, the same as in the UI. Unhide the layer (e.g. CreateLayers with isHidden:false and overwriteExisting) or move the element to a visible layer first.";
+        case APIERR_LOCKEDLAY:
+            return baseMessage + " The element's layer is locked; Archicad refuses to change elements on a locked layer via the API, the same as in the UI. Unlock the layer first.";
+        case APIERR_NOACCESSRIGHT:
+            return baseMessage + " No access right to change this element - likely a Teamwork permission restriction.";
+        case APIERR_NOTMINE:
+            return baseMessage + " This element is not reserved by the current Teamwork session; it must be reserved/checked out before it can be changed.";
+        default:
+            return baseMessage;
+    }
 }
 
 API_Guid GetGuidFromObjectState (const GS::ObjectState& os)
@@ -505,27 +527,6 @@ API_HatchOrientation GetHatchOrientationFromObjectState (const GS::ObjectState& 
     return orientation;
 }
 
-GS::UniString DrawingNameTypeToString (API_NameTypeValues nameType)
-{
-    switch (nameType) {
-        case APIName_ViewIdAndName:  return "ViewIdAndName";
-        case APIName_CustomName:     return "CustomName";
-        default:
-        case APIName_ViewOrSrcFileName: return "ViewOrSourceFileName";
-    }
-}
-
-API_NameTypeValues DrawingNameTypeFromString (const GS::UniString& str, API_NameTypeValues defaultValue)
-{
-    if (str == "ViewIdAndName")
-        return APIName_ViewIdAndName;
-    if (str == "CustomName")
-        return APIName_CustomName;
-    if (str == "ViewOrSourceFileName")
-        return APIName_ViewOrSrcFileName;
-    return defaultValue;
-}
-
 void AddBeamHolesFromMemo (const API_Guid& elemGuid, GS::ObjectState& os, const GS::String& holesFieldName)
 {
     const auto& holes = os.AddList<GS::ObjectState> (holesFieldName);
@@ -691,21 +692,6 @@ bool GetHoleGeometry (const GS::ObjectState& holeOs, GS::Array<GS::ObjectState>&
     return true;
 }
 
-GS::Optional<GS::UniString> ValidateHoles (const GS::Array<GS::ObjectState>& holes)
-{
-    for (UIndex holeIndex = 0; holeIndex < holes.GetSize (); ++holeIndex) {
-        GS::Array<GS::ObjectState> holeCoords;
-        GS::Array<GS::ObjectState> holeArcs;
-        if (!GetHoleGeometry (holes[holeIndex], holeCoords, holeArcs)) {
-            return GS::UniString::Printf ("Invalid hole at index %d: each hole must be an object with a 'polygonOutline' (or legacy 'polygonCoordinates') coordinate array.", (int) holeIndex);
-        }
-        if (holeCoords.GetSize () < 3) {
-            return GS::UniString::Printf ("Invalid hole at index %d: the hole outline must contain at least 3 coordinates.", (int) holeIndex);
-        }
-    }
-    return {};
-}
-
 GS::ObjectState CreateIdObjectState (const GS::String& idFieldName, const API_Guid& guid)
 {
     return GS::ObjectState (idFieldName, CreateGuidObjectState (guid));
@@ -739,6 +725,22 @@ bool GetColor (const GS::ObjectState& objectState, const GS::String& fieldName, 
     outColor = GetColorFromObjectState(colorOS);
 
     return true;
+}
+
+void EnsureStoryIsActive (short floorIndex)
+{
+    API_StoryInfo storyInfo = {};
+    if (ACAPI_ProjectSetting_GetStorySettings (&storyInfo) != NoError) return;
+    const short actStory = storyInfo.actStory;
+    if (storyInfo.data != nullptr) BMKillHandle ((GSHandle*) &storyInfo.data);
+    if (actStory == floorIndex) return;
+
+    API_WindowInfo windowInfo = {};
+    windowInfo.typeID = APIWind_FloorPlanID;
+    windowInfo.index = floorIndex;
+    if (ACAPI_Window_GetDatabaseInfo (&windowInfo) != NoError) return;
+    ACAPI_Database_ChangeCurrentDatabase (&windowInfo);
+    ACAPI_Window_ChangeWindow (&windowInfo);
 }
 
 Stories GetStories ()
@@ -1088,41 +1090,4 @@ bool DoesElementExist (const API_Guid& elementGuid, API_ElemTypeID expectedTypeI
         return false;
     }
     return GetElemTypeId (header) == expectedTypeId;
-}
-
-
-API_Tranmat CreateHotlinkTransformation (const API_Coord3D& origin, double rotationAngle, bool mirrored)
-{
-    API_Tranmat transformation = {};
-    const double co = std::cos (rotationAngle);
-    const double si = std::sin (rotationAngle);
-    const double mx = mirrored ? -1.0 : 1.0;
-
-    transformation.tmx[0]  = co * mx;
-    transformation.tmx[1]  = -si;
-    transformation.tmx[2]  = 0.0;
-    transformation.tmx[3]  = origin.x;
-
-    transformation.tmx[4]  = si * mx;
-    transformation.tmx[5]  = co;
-    transformation.tmx[6]  = 0.0;
-    transformation.tmx[7]  = origin.y;
-
-    transformation.tmx[8]  = 0.0;
-    transformation.tmx[9]  = 0.0;
-    transformation.tmx[10] = 1.0;
-    transformation.tmx[11] = origin.z;
-
-    return transformation;
-}
-
-void DecomposeHotlinkTransformation (const API_Tranmat& transformation, API_Coord3D& origin, double& rotationAngle, bool& mirrored)
-{
-    origin = { transformation.tmx[3], transformation.tmx[7], transformation.tmx[11] };
-    // The image of the local Y axis is the second column, (-sin, cos), and a
-    // mirror of the local X axis leaves it alone - so the angle reads off it
-    // regardless of mirroring, and the mirror reads off the determinant.
-    rotationAngle = std::atan2 (-transformation.tmx[1], transformation.tmx[5]);
-    const double det = transformation.tmx[0] * transformation.tmx[5] - transformation.tmx[1] * transformation.tmx[4];
-    mirrored = det < 0.0;
 }

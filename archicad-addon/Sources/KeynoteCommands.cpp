@@ -372,7 +372,7 @@ GS::ObjectState CreateKeynoteFoldersCommand::Execute (const GS::ObjectState& par
     GS::ObjectState response;
     const auto& keynoteFolderIdsOrErrors = response.AddList<GS::ObjectState> ("keynoteFolderIdsOrErrors");
 
-    ACAPI_CallUndoableCommand ("Create Keynote Folders", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("Create Keynote Folders", [&]() -> GSErrCode {
         for (const GS::ObjectState& folderData : foldersData) {
             GS::UniString key;
             GS::UniString title;
@@ -397,6 +397,7 @@ GS::ObjectState CreateKeynoteFoldersCommand::Execute (const GS::ObjectState& par
         }
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 #else
@@ -494,7 +495,7 @@ GS::ObjectState CreateKeynoteItemsCommand::Execute (const GS::ObjectState& param
     GS::ObjectState response;
     const auto& keynoteItemIdsOrErrors = response.AddList<GS::ObjectState> ("keynoteItemIdsOrErrors");
 
-    ACAPI_CallUndoableCommand ("Create Keynote Items", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("Create Keynote Items", [&]() -> GSErrCode {
         for (const GS::ObjectState& itemData : itemsData) {
             GS::UniString key;
             if (!itemData.Get ("key", key)) {
@@ -531,6 +532,7 @@ GS::ObjectState CreateKeynoteItemsCommand::Execute (const GS::ObjectState& param
         }
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 #else
@@ -624,7 +626,7 @@ GS::ObjectState ModifyKeynoteFoldersCommand::Execute (const GS::ObjectState& par
     GS::ObjectState response;
     const auto& executionResults = response.AddList<GS::ObjectState> ("executionResults");
 
-    ACAPI_CallUndoableCommand ("Modify Keynote Folders", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("Modify Keynote Folders", [&]() -> GSErrCode {
         for (const GS::ObjectState& folderData : foldersData) {
             const GS::ObjectState* folderId = folderData.Get ("keynoteFolderId");
             if (folderId == nullptr) {
@@ -658,6 +660,7 @@ GS::ObjectState ModifyKeynoteFoldersCommand::Execute (const GS::ObjectState& par
         }
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 #else
@@ -743,7 +746,7 @@ GS::ObjectState ModifyKeynoteItemsCommand::Execute (const GS::ObjectState& param
     GS::ObjectState response;
     const auto& executionResults = response.AddList<GS::ObjectState> ("executionResults");
 
-    ACAPI_CallUndoableCommand ("Modify Keynote Items", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("Modify Keynote Items", [&]() -> GSErrCode {
         for (const GS::ObjectState& itemData : itemsData) {
             const GS::ObjectState* itemId = itemData.Get ("keynoteItemId");
             if (itemId == nullptr) {
@@ -782,6 +785,7 @@ GS::ObjectState ModifyKeynoteItemsCommand::Execute (const GS::ObjectState& param
         }
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 #else
@@ -846,7 +850,7 @@ GS::ObjectState DeleteKeynoteFoldersCommand::Execute (const GS::ObjectState& par
     GS::ObjectState response;
     const auto& executionResults = response.AddList<GS::ObjectState> ("executionResults");
 
-    ACAPI_CallUndoableCommand ("Delete Keynote Folders", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("Delete Keynote Folders", [&]() -> GSErrCode {
         for (const GS::ObjectState& keynoteFolderId : keynoteFolderIds) {
             const API_Guid folderId = GetGuidFromArrayItem ("keynoteFolderId", keynoteFolderId);
 
@@ -874,6 +878,7 @@ GS::ObjectState DeleteKeynoteFoldersCommand::Execute (const GS::ObjectState& par
         }
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 #else
@@ -938,7 +943,7 @@ GS::ObjectState DeleteKeynoteItemsCommand::Execute (const GS::ObjectState& param
     GS::ObjectState response;
     const auto& executionResults = response.AddList<GS::ObjectState> ("executionResults");
 
-    ACAPI_CallUndoableCommand ("Delete Keynote Items", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("Delete Keynote Items", [&]() -> GSErrCode {
         for (const GS::ObjectState& keynoteItemId : keynoteItemIds) {
             std::optional<std::pair<KeynoteFolder, KeynoteItem>> found = FindKeynoteItemById (rootFolder.Unwrap (), GetGuidFromArrayItem ("keynoteItemId", keynoteItemId));
             if (!found.has_value ()) {
@@ -953,6 +958,7 @@ GS::ObjectState DeleteKeynoteItemsCommand::Execute (const GS::ObjectState& param
         }
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 #else
@@ -1046,7 +1052,7 @@ GS::ObjectState CreateKeynoteLabelsCommand::Execute (const GS::ObjectState& para
     GS::ObjectState response;
     const auto& elements = response.AddList<GS::ObjectState> ("elements");
 
-    ACAPI_CallUndoableCommand ("Create Keynote Labels", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("Create Keynote Labels", [&]() -> GSErrCode {
         for (const GS::ObjectState& labelData : labelsData) {
             const GS::ObjectState* keynoteItemId = labelData.Get ("keynoteItemId");
             const GS::ObjectState* position = labelData.Get ("position");
@@ -1120,6 +1126,7 @@ GS::ObjectState CreateKeynoteLabelsCommand::Execute (const GS::ObjectState& para
         }
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 #else

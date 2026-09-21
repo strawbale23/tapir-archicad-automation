@@ -1,6 +1,4 @@
 #include "ElementCommands.hpp"
-
-#include "ElementCreationCommands.hpp"
 #include "MigrationHelper.hpp"
 #include "GSUnID.hpp"
 #include "Plane.hpp"
@@ -10,35 +8,16 @@
 #include "NativeImage.hpp"
 #include "MemoryOChannel32.hpp"
 #include "Base64Converter.hpp"
+#include "NativeFieldFilterDefinitions.hpp"
+#include "ClassificationCommands.hpp"
+#include "PropertyCommands.hpp"
+#include "NativeProjectCommands.hpp"
 #ifdef ServerMainVers_2800
 #include "ACAPI/ZoneBoundaryQuery.hpp"
 #endif
 
 #include <algorithm>
 #include <cmath>
-
-// The pivot polygon of a multi-plane roof lives in the memo's additional polygon
-// (APIMemoMask_AdditionalPolygon); the first sub-polygon is the outline. Arcs are
-// not carried: a curved pivot edge comes back as its end points (schema says so).
-static void AddPivotPolygonFromMemo (const API_Guid& guid, GS::ObjectState& os)
-{
-    API_ElementMemo memo = {};
-    if (ACAPI_Element_GetMemo (guid, &memo, APIMemoMask_AdditionalPolygon) != NoError || memo.additionalPolyCoords == nullptr) {
-        ACAPI_DisposeElemMemoHdls (&memo);
-        return;
-    }
-    const GSSize nCoords = BMhGetSize (reinterpret_cast<GSHandle> (memo.additionalPolyCoords)) / sizeof (API_Coord);
-    GSIndex last = nCoords - 1;
-    if (memo.additionalPolyPends != nullptr && BMhGetSize (reinterpret_cast<GSHandle> (memo.additionalPolyPends)) / sizeof (Int32) > 1) {
-        last = (*memo.additionalPolyPends)[1];
-    }
-    const auto& coords = os.AddList<GS::ObjectState> ("pivotPolygonOutline");
-    for (GSIndex i = 1; i <= last && i < nCoords; ++i) {
-        coords (Create2DCoordinateObjectState ((*memo.additionalPolyCoords)[i]));
-    }
-    ACAPI_DisposeElemMemoHdls (&memo);
-}
-
 
 // Shared "line-family settings" fields present on Line/PolyLine/Arc/Circle/Spline
 // (API_LineType/API_PolyLineType/API_ArcType/API_SplineType all share this exact shape).
@@ -120,6 +99,25 @@ static API_ElemFilterFlags ConvertFilterStringToFlag (const GS::UniString& filte
     if (filter == "IsOverriddenByRenovation")
         return APIFilt_IsOverridden;
     return APIFilt_None;
+}
+
+static GS::UniString DrawingNameTypeToString (API_NameTypeValues nameType)
+{
+    switch (nameType) {
+        case APIName_ViewIdAndName:  return "ViewIdAndName";
+        case APIName_CustomName:     return "CustomName";
+        default:
+        case APIName_ViewOrSrcFileName: return "ViewOrSourceFileName";
+    }
+}
+
+static API_NameTypeValues DrawingNameTypeFromString (const GS::UniString& str)
+{
+    if (str == "ViewIdAndName")
+        return APIName_ViewIdAndName;
+    if (str == "CustomName")
+        return APIName_CustomName;
+    return APIName_ViewOrSrcFileName;
 }
 
 static GS::UniString DrawingNumberingTypeToString (API_NumberingTypeValues numberingType)
@@ -482,14 +480,6 @@ GS::Optional<GS::UniString> GetDetailsOfElementsCommand::GetInputParametersSchem
         "properties": {
             "elements": {
                 "$ref": "#/Elements"
-            },
-            "fields": {
-                "type": "array",
-                "description": "Optional filter for the fields to return for each element. When omitted, every field is returned. Fields not listed are not computed at all, so listing only what you need skips in particular the floorPlanPolygons extraction, which regenerates each element's 2D drawing primitives and can dominate the execution time of batch reads.",
-                "items": {
-                    "$ref": "#/ElementDetailsField"
-                },
-                "minItems": 1
             }
         },
         "additionalProperties": false,
@@ -508,7 +498,7 @@ GS::Optional<GS::UniString> GetDetailsOfElementsCommand::GetRawResponseSchema ()
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "description": "Details of an element. When the optional fields filter is given in the input, only the requested fields are present; the required list below applies to unfiltered requests.",
+                    "description": "Details of an element.",
                     "properties": {
                         "type": {
                             "$ref": "#/ElementType"
@@ -524,10 +514,6 @@ GS::Optional<GS::UniString> GetDetailsOfElementsCommand::GetRawResponseSchema ()
                         },
                         "drawIndex": {
                             "type": "number"
-                        },
-                        "hotlinkId": {
-                            "$ref": "#/ElementId",
-                            "description": "The hotlink instance this element belongs to. Present only for elements that came in through a placed hotlink; such elements are read-only."
                         },
                         "details": {
                             "$ref": "#/TypeSpecificDetails"
@@ -827,12 +813,6 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
     GS::Array<GS::ObjectState> elements;
     parameters.Get ("elements", elements);
 
-    GS::Array<GS::UniString> fields;
-    const bool filterFields = parameters.Get ("fields", fields) && !fields.IsEmpty ();
-    const auto isFieldRequested = [&] (const char* fieldName) {
-        return !filterFields || fields.Contains (GS::UniString (fieldName));
-    };
-
     GS::ObjectState response;
     const auto& detailsOfElements = response.AddList<GS::ObjectState> ("detailsOfElements");
 
@@ -857,36 +837,17 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
         GS::ObjectState detailsOfElement;
         const API_ElemTypeID typeID = GetElemTypeId (elem.header);
 
-        if (isFieldRequested ("type")) {
-            detailsOfElement.Add ("type", GetElementTypeNonLocalizedName (typeID));
-        }
-        if (isFieldRequested ("floorIndex")) {
-            detailsOfElement.Add ("floorIndex", elem.header.floorInd);
-        }
-        if (isFieldRequested ("layerIndex")) {
-            detailsOfElement.Add ("layerIndex", GetAttributeIndex (elem.header.layer));
-        }
-        if (isFieldRequested ("drawIndex")) {
-            detailsOfElement.Add ("drawIndex", static_cast<short> (elem.header.drwIndex));
-        }
-        if (isFieldRequested ("hotlinkId") && elem.header.hotlinkGuid != APINULLGuid) {
-            detailsOfElement.Add ("hotlinkId", CreateElementIdObjectState (elem.header.hotlinkGuid));
-        }
+        detailsOfElement.Add ("type", GetElementTypeNonLocalizedName (typeID));
+        detailsOfElement.Add ("floorIndex", elem.header.floorInd);
+        detailsOfElement.Add ("layerIndex", GetAttributeIndex (elem.header.layer));
+        detailsOfElement.Add ("drawIndex", static_cast<short> (elem.header.drwIndex));
 
-        if (isFieldRequested ("id")) {
+        {
             API_ElementMemo memo = {};
             const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
             ACAPI_Element_GetMemo (elem.header.guid, &memo, APIMemoMask_ElemInfoString);
 
             detailsOfElement.Add ("id", memo.elemInfoString != nullptr ? *memo.elemInfoString : GS::EmptyUniString);
-        }
-
-        if (!isFieldRequested ("details")) {
-            if (isFieldRequested ("floorPlanPolygons")) {
-                AddFloorPlanPolygonsIfAvailable (elem.header.guid, detailsOfElement);
-            }
-            detailsOfElements (detailsOfElement);
-            continue;
         }
 
         GS::ObjectState typeSpecificDetails;
@@ -916,6 +877,7 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("bottomOffset", elem.wall.bottomOffset);
                 typeSpecificDetails.Add ("offset", elem.wall.offset);
                 typeSpecificDetails.Add ("flipped", elem.wall.flipped);
+                typeSpecificDetails.Add ("junctionOrder", elem.wall.sequence);
                 if (elem.wall.type == APIWtyp_Poly) {
                     typeSpecificDetails.Add ("begThickness", 0);
                     typeSpecificDetails.Add ("endThickness", 0);
@@ -1083,56 +1045,13 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("oSide", elem.window.openingBase.oSide);
                 break;
 
-            case API_LabelID: {
+            case API_LabelID:
                 AddLibPartBasedElementDetails (typeSpecificDetails, ((elem.label.labelClass == APILblClass_Symbol) ? elem.label.u.symbol.libInd : -1), elem.label.parent, GetElemTypeId (elem.label.parentType));
                 typeSpecificDetails.Add ("begCoordinate", Create2DCoordinateObjectState (elem.label.begC));
                 typeSpecificDetails.Add ("midCoordinate", Create2DCoordinateObjectState (elem.label.midC));
                 typeSpecificDetails.Add ("endCoordinate", Create2DCoordinateObjectState (elem.label.endC));
                 typeSpecificDetails.Add ("hasLeaderLine", elem.label.hasLeaderLine);
-
-                typeSpecificDetails.Add ("labelClass", elem.label.labelClass == APILblClass_Symbol ? "Symbol" : "Text");
-
-                GS::ObjectState leaderLineOS;
-                TextLabelDetails::AddLabelLeaderLineDetails (leaderLineOS, elem.label);
-                typeSpecificDetails.Add ("leaderLine", leaderLineOS);
-
-                if (elem.label.labelClass == APILblClass_Text) {
-                    GS::ObjectState styleOS;
-                    TextLabelDetails::AddTextStyleDetails (styleOS, elem.label.u.text, true);
-                    typeSpecificDetails.Add ("style", styleOS);
-                    if (TextLabelDetails::AddTextContent (typeSpecificDetails, elem.header.guid) != NoError) {
-                        // The fields are required by the schema; an unreadable memo reads as empty content.
-                        typeSpecificDetails.Add ("text", GS::EmptyUniString);
-                        typeSpecificDetails.Add ("paragraphCount", 0);
-                    }
-                } else {
-                    GS::ObjectState symbolStyleOS;
-                    TextLabelDetails::AddLabelSymbolStyleDetails (symbolStyleOS, elem.label);
-                    typeSpecificDetails.Add ("symbolStyle", symbolStyleOS);
-                }
                 break;
-            }
-
-            case API_TextID: {
-                // The flat fields are the ones SetDetailsOfElements takes back (position, angle, height,
-                // justification) and the Grasshopper TextDetails type reads; "style" carries the full
-                // style state and AddTextContent adds "text", "paragraphCount" and the styled "runs".
-                typeSpecificDetails.Add ("position", Create2DCoordinateObjectState (elem.text.loc));
-                typeSpecificDetails.Add ("angle", elem.text.angle);
-                typeSpecificDetails.Add ("height", elem.text.size);
-                typeSpecificDetails.Add ("pen", (Int32) elem.text.pen);
-                typeSpecificDetails.Add ("justification", JustificationToString (static_cast<API_JustID> (elem.text.just)));
-                typeSpecificDetails.Add ("zCoordinate", GetZPos (elem.header.floorInd, 0, stories));
-                GS::ObjectState styleOS;
-                TextLabelDetails::AddTextStyleDetails (styleOS, elem.text, true);
-                typeSpecificDetails.Add ("style", styleOS);
-                if (TextLabelDetails::AddTextContent (typeSpecificDetails, elem.header.guid) != NoError) {
-                    // The fields are required by the schema; an unreadable memo reads as empty content.
-                    typeSpecificDetails.Add ("text", GS::EmptyUniString);
-                    typeSpecificDetails.Add ("paragraphCount", 0);
-                }
-                break;
-            }
 
             case API_ObjectID:
             case API_LampID:
@@ -1435,66 +1354,13 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 AddMorphBodyFromMemo (elem, typeSpecificDetails);
                 break;
 
-            case API_RoofID: {
-                const API_ShellBaseType& base = elem.roof.shellBase;
-                typeSpecificDetails.Add ("roofClass", elem.roof.roofClass == API_PolyRoofID ? "MultiPlane" : "SinglePlane");
-                typeSpecificDetails.Add ("structureType", StructureTypeToString (base.modelElemStructureType));
-                typeSpecificDetails.Add ("thickness", base.thickness);
-                typeSpecificDetails.Add ("level", base.level);
-                typeSpecificDetails.Add ("zCoordinate", GetZPos (elem.header.floorInd, base.level, stories));
-                if (StructureTypeToString (base.modelElemStructureType) == "Composite") {
-                    typeSpecificDetails.Add ("compositeId", CreateGuidObjectState (GetAttributeGuidFromIndex (API_CompWallID, base.composite)));
-                } else {
-                    typeSpecificDetails.Add ("buildingMaterialId", CreateGuidObjectState (GetAttributeGuidFromIndex (API_BuildingMaterialID, base.buildingMaterial)));
-                }
-                if (elem.roof.roofClass == API_PlaneRoofID) {
-                    typeSpecificDetails.Add ("angle", elem.roof.u.planeRoof.angle);
-                    GS::ObjectState pivotLine;
-                    pivotLine.Add ("begin", Create2DCoordinateObjectState (elem.roof.u.planeRoof.baseLine.c1));
-                    pivotLine.Add ("end", Create2DCoordinateObjectState (elem.roof.u.planeRoof.baseLine.c2));
-                    typeSpecificDetails.Add ("pivotLine", pivotLine);
-                } else {
-                    typeSpecificDetails.Add ("eavesOverhang", elem.roof.u.polyRoof.eavesOverHang);
-                    const auto& levels = typeSpecificDetails.AddList<GS::ObjectState> ("levels");
-                    for (short i = 0; i < elem.roof.u.polyRoof.levelNum && i < 16; ++i) {
-                        GS::ObjectState level;
-                        level.Add ("height", elem.roof.u.polyRoof.levelData[i].levelHeight);
-                        level.Add ("angle", elem.roof.u.polyRoof.levelData[i].levelAngle);
-                        levels (level);
-                    }
-                    AddPivotPolygonFromMemo (elem.header.guid, typeSpecificDetails);
-                }
-                // the roof's own polygon: the plane roof's outline, the multi-plane roof's contour
-                AddPolygonWithHolesFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonOutline", "polygonArcs", "holes", "polygonOutline", "polygonArcs");
-            } break;
-
-            case API_HotlinkID: {
-                API_Coord3D origin;
-                double rotationAngle;
-                bool mirrored;
-                DecomposeHotlinkTransformation (elem.hotlink.transformation, origin, rotationAngle, mirrored);
-                typeSpecificDetails.Add ("hotlinkType", elem.hotlink.type == APIHotlink_XRef ? "XRef" : "Module");
-                typeSpecificDetails.Add ("hotlinkNodeId", CreateGuidObjectState (elem.hotlink.hotlinkNodeGuid));
-                typeSpecificDetails.Add ("origin", Create3DCoordinateObjectState (origin));
-                typeSpecificDetails.Add ("rotationAngle", rotationAngle);
-                typeSpecificDetails.Add ("mirrored", mirrored);
-                typeSpecificDetails.Add ("floorDifference", elem.hotlink.floorDifference);
-                typeSpecificDetails.Add ("skipNested", elem.hotlink.skipNested);
-                typeSpecificDetails.Add ("suspendFixAngle", elem.hotlink.suspendFixAngle);
-                typeSpecificDetails.Add ("ignoreTopFloorLinks", elem.hotlink.ignoreTopFloorLinks);
-                typeSpecificDetails.Add ("relinkWallOpenings", elem.hotlink.relinkWallOpenings);
-                typeSpecificDetails.Add ("adjustLevelDiffs", elem.hotlink.adjustLevelDiffs);
-            } break;
-
             default:
                 typeSpecificDetails.Add ("error", "Not yet supported element type");
                 break;
         }
 
         detailsOfElement.Add ("details", typeSpecificDetails);
-        if (isFieldRequested ("floorPlanPolygons")) {
-            AddFloorPlanPolygonsIfAvailable (elem.header.guid, detailsOfElement);
-        }
+        AddFloorPlanPolygonsIfAvailable (elem.header.guid, detailsOfElement);
 
         detailsOfElements (detailsOfElement);
     }
@@ -1766,13 +1632,127 @@ static bool GetIndexValue (const GS::ObjectState& os, const char* fieldName, Int
     return false;
 }
 
+static GS::Optional<GS::UniString> CheckGenericDetailApplicability (const API_Element& element, const GS::ObjectState& details)
+{
+    const GS::ObjectState* specific = details.Get ("typeSpecificDetails");
+    if (specific == nullptr) return {};
+    GS::HashSet<GS::String> allowed;
+    switch (GetElemTypeId (element.header)) {
+        case API_WallID:
+            allowed.Add ("begCoordinate");
+            allowed.Add ("endCoordinate");
+            allowed.Add ("height");
+            allowed.Add ("bottomOffset");
+            allowed.Add ("offset");
+            allowed.Add ("begThickness");
+            allowed.Add ("endThickness");
+            break;
+        case API_ZoneID:
+            allowed.Add ("stampPosition");
+            allowed.Add ("stampAngle");
+            allowed.Add ("fixedStampAngle");
+            allowed.Add ("name");
+            allowed.Add ("numberStr");
+            allowed.Add ("categoryAttributeId");
+            break;
+        case API_LineID:
+            allowed.Add ("begCoordinate");
+            allowed.Add ("endCoordinate");
+            allowed.Add ("roomSeparator");
+            allowed.Add ("linePenIndex");
+            allowed.Add ("lineTypeId");
+            break;
+        case API_ArcID:
+            allowed.Add ("origin");
+            allowed.Add ("radius");
+            allowed.Add ("angle");
+            allowed.Add ("ratio");
+            allowed.Add ("begAngle");
+            allowed.Add ("endAngle");
+            allowed.Add ("reflected");
+            allowed.Add ("roomSeparator");
+            allowed.Add ("linePenIndex");
+            allowed.Add ("lineTypeId");
+            break;
+        case API_CircleID:
+            allowed.Add ("origin");
+            allowed.Add ("radius");
+            allowed.Add ("angle");
+            allowed.Add ("ratio");
+            allowed.Add ("begAngle");
+            allowed.Add ("endAngle");
+            allowed.Add ("reflected");
+            allowed.Add ("roomSeparator");
+            allowed.Add ("linePenIndex");
+            allowed.Add ("lineTypeId");
+            break;
+        case API_HotspotID:
+            allowed.Add ("position");
+            allowed.Add ("height");
+            allowed.Add ("penIndex");
+            break;
+        case API_SplineID:
+            allowed.Add ("roomSeparator");
+            allowed.Add ("linePenIndex");
+            allowed.Add ("lineTypeId");
+            break;
+        case API_PolyLineID:
+            allowed.Add ("coordinates");
+            allowed.Add ("arcs");
+            allowed.Add ("roomSeparator");
+            allowed.Add ("linePenIndex");
+            allowed.Add ("lineTypeId");
+            break;
+        case API_HatchID:
+            allowed.Add ("coordinates");
+            allowed.Add ("arcs");
+            allowed.Add ("holes");
+            allowed.Add ("contourPenIndex");
+            allowed.Add ("fillPenIndex");
+            allowed.Add ("fillBackgroundPenIndex");
+            allowed.Add ("fillId");
+            allowed.Add ("buildingMaterialId");
+            allowed.Add ("roomSpecial");
+            allowed.Add ("showArea");
+            break;
+        case API_DrawingID:
+            allowed.Add ("pos");
+            allowed.Add ("angle");
+            allowed.Add ("ratio");
+            allowed.Add ("modelOffset");
+            allowed.Add ("clipPolygon");
+            allowed.Add ("nameType");
+            allowed.Add ("customName");
+            allowed.Add ("numberingType");
+            allowed.Add ("customNumber");
+            allowed.Add ("isInNumbering");
+            allowed.Add ("titleLibraryPartIndex");
+            break;
+        default: return GS::UniString ("typeSpecificDetails is unsupported for this native type; use its typed modifier.");
+    }
+    for (const GS::String& field : specific->GetFieldNames ()) {
+        if (!allowed.Contains (field)) return GS::UniString ("Unsupported field for this native type: ") + GS::UniString (field);
+    }
+    if (GetElemTypeId (element.header) == API_WallID && element.wall.type != APIWtyp_Trapez &&
+        (specific->Contains ("begThickness") || specific->Contains ("endThickness")))
+        return GS::UniString ("begThickness/endThickness require a trapezoid wall. Use ModifyWalls.thickness for a straight Basic wall.");
+    if (GetElemTypeId (element.header) == API_CircleID && (specific->Contains ("begAngle") || specific->Contains ("endAngle")))
+        return GS::UniString ("begAngle/endAngle require an Arc, not a Circle.");
+    return {};
+}
+
 GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
 {
     GS::Array<GS::ObjectState> elementsWithDetails;
     parameters.Get ("elementsWithDetails", elementsWithDetails);
 
     GS::ObjectState response;
-    const auto& executionResults = response.AddList<GS::ObjectState> ("executionResults");
+    std::vector<UIndex> sourceIndices;
+    std::vector<GS::ObjectState> resultsByInput (elementsWithDetails.GetSize ());
+    UIndex resultPosition = 0;
+    const auto executionResults = [&] (const GS::ObjectState& result) {
+        resultsByInput[sourceIndices[resultPosition++]] = result;
+    };
 
     // Pre-scan: identify openings (Door/Window/Skylight) that need host manipulation:
     //   - target > 7  : elevate via host (step up, step back)
@@ -1796,18 +1776,24 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
     // Process openings first so host manipulation starts from the host's natural position,
     // not a position already shifted by another element in the same batch.
     GS::Array<GS::ObjectState> sortedElements;
-    for (const GS::ObjectState& ewd : elementsWithDetails) {
+    for (UIndex index = 0; index < elementsWithDetails.GetSize (); ++index) {
+        const auto& ewd = elementsWithDetails[index];
         const GS::ObjectState* eid = ewd.Get ("elementId");
-        if (eid != nullptr && openingsNeedingHost.Contains (GetGuidFromObjectState (*eid)))
+        if (eid != nullptr && openingsNeedingHost.Contains (GetGuidFromObjectState (*eid))) {
             sortedElements.Push (ewd);
+            sourceIndices.push_back (index);
+        }
     }
-    for (const GS::ObjectState& ewd : elementsWithDetails) {
+    for (UIndex index = 0; index < elementsWithDetails.GetSize (); ++index) {
+        const auto& ewd = elementsWithDetails[index];
         const GS::ObjectState* eid = ewd.Get ("elementId");
-        if (eid == nullptr || !openingsNeedingHost.Contains (GetGuidFromObjectState (*eid)))
+        if (eid == nullptr || !openingsNeedingHost.Contains (GetGuidFromObjectState (*eid))) {
             sortedElements.Push (ewd);
+            sourceIndices.push_back (index);
+        }
     }
 
-    ACAPI_CallUndoableCommand ("SetDetailsOfElementsCommand", [&]() {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("SetDetailsOfElementsCommand", [&]() {
         for (const GS::ObjectState& elementWithDetails : sortedElements) {
             const GS::ObjectState* elementId = elementWithDetails.Get ("elementId");
             if (elementId == nullptr) {
@@ -1830,6 +1816,11 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 continue;
             }
 
+            auto applicabilityError = CheckGenericDetailApplicability (elem, *details);
+            if (applicabilityError.HasValue ()) {
+                executionResults (CreateFailedExecutionResult (APIERR_BADPARS, applicabilityError.Get ()));
+                continue;
+            }
             API_Element mask = {};
             ACAPI_ELEMENT_MASK_CLEAR (mask);
             bool hasElementChanges = false;
@@ -1845,10 +1836,6 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
             }
             short drwIndexTarget = -1;
             GetIndexValue (*details, "drawIndex", drwIndexTarget);
-
-            API_ElementMemo clipMemo = {};
-            UInt64 memoMask = 0;
-            bool hasMemoChanges = false;
 
             const GS::ObjectState* typeSpecificDetails = details->Get ("typeSpecificDetails");
             if (typeSpecificDetails != nullptr) {
@@ -1866,6 +1853,9 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                         }
                         if (typeSpecificDetails->Get ("height", elem.wall.height)) {
                             ACAPI_ELEMENT_MASK_SET (mask, API_WallType, height);
+                        }
+                        if (typeSpecificDetails->Get ("bottomOffset", elem.wall.bottomOffset)) {
+                            ACAPI_ELEMENT_MASK_SET (mask, API_WallType, bottomOffset);
                         }
                         if (typeSpecificDetails->Get ("offset", elem.wall.offset)) {
                             ACAPI_ELEMENT_MASK_SET (mask, API_WallType, offset);
@@ -1895,6 +1885,17 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                         }
                         if (typeSpecificDetails->Get ("fixedStampAngle", elem.zone.fixedAngle)) {
                             ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, fixedAngle);
+                        }
+                        if (SetUCharProperty (typeSpecificDetails, "name", elem.zone.roomName)) {
+                            ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, roomName);
+                        }
+                        if (SetUCharProperty (typeSpecificDetails, "numberStr", elem.zone.roomNoStr)) {
+                            ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, roomNoStr);
+                        }
+                        const GS::ObjectState* categoryAttributeId = typeSpecificDetails->Get ("categoryAttributeId");
+                        if (categoryAttributeId != nullptr) {
+                            elem.zone.catInd = GetAttributeIndexFromGuid (API_ZoneCatID, GetGuidFromObjectState (*categoryAttributeId));
+                            ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, catInd);
                         }
                     } break;
                     case API_LineID: {
@@ -1987,14 +1988,6 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                             elem.drawing.poly.nArcs        = 0;
                             ACAPI_ELEMENT_MASK_SET (mask, API_DrawingType, isCutWithFrame);
                             ACAPI_ELEMENT_MASK_SET (mask, API_DrawingType, poly);
-                        } else if (typeSpecificDetails->Get ("isCutWithFrame", elem.drawing.isCutWithFrame)) {
-                            // No clipPolygon supplied: only the flag itself is changed. false clears
-                            // cropping and restores the full extent (#651); true re-enables whatever
-                            // clip polygon is still stored on the Drawing.
-                            ACAPI_ELEMENT_MASK_SET (mask, API_DrawingType, isCutWithFrame);
-                        }
-                        if (typeSpecificDetails->Get ("drawingScale", elem.drawing.drawingScale)) {
-                            ACAPI_ELEMENT_MASK_SET (mask, API_DrawingType, drawingScale);
                         }
                         if (typeSpecificDetails->Get ("ratio", elem.drawing.ratio)) {
                             ACAPI_ELEMENT_MASK_SET (mask, API_DrawingType, ratio);
@@ -2038,58 +2031,15 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                             ACAPI_ELEMENT_MASK_SET (mask, API_DrawingType, title.libInd);
                         }
                     } break;
-                    case API_TextID: {
-                        const GS::ObjectState* position = typeSpecificDetails->Get ("position");
-                        if (position != nullptr) {
-                            elem.text.loc = Get2DCoordinateFromObjectState (*position);
-                            ACAPI_ELEMENT_MASK_SET (mask, API_TextType, loc);
-                        }
-                        if (typeSpecificDetails->Get ("angle", elem.text.angle)) {
-                            ACAPI_ELEMENT_MASK_SET (mask, API_TextType, angle);
-                        }
-                        if (typeSpecificDetails->Get ("height", elem.text.size)) {
-                            ACAPI_ELEMENT_MASK_SET (mask, API_TextType, size);
-                        }
-                        GS::UniString justification;
-                        if (typeSpecificDetails->Get ("justification", justification)) {
-                            elem.text.just = ParseJustificationString (justification);
-                            ACAPI_ELEMENT_MASK_SET (mask, API_TextType, just);
-                        }
-                        GS::UniString text;
-                        if (typeSpecificDetails->Get ("text", text)) {
-                            // Same content handling as CreateTexts: the whole textContent is replaced
-                            // and the paragraphs memo is rebuilt as a single paragraph/run, so any
-                            // per-run formatting of the old content is dropped and the element becomes
-                            // auto-width (nonBreaking) - mask exactly the API_TextType fields the helper sets.
-                            SetTextContentAndParagraphs (clipMemo, elem.text, text);
-                            ACAPI_ELEMENT_MASK_SET (mask, API_TextType, nLine);
-                            ACAPI_ELEMENT_MASK_SET (mask, API_TextType, useEolPos);
-                            ACAPI_ELEMENT_MASK_SET (mask, API_TextType, nonBreaking);
-                            ACAPI_ELEMENT_MASK_SET (mask, API_TextType, width);
-                            ACAPI_ELEMENT_MASK_SET (mask, API_TextType, height);
-                            memoMask = APIMemoMask_TextContent | APIMemoMask_Paragraph;
-                            hasMemoChanges = true;
-                        }
-                    } break;
-                    case API_LabelID: {
-                        GS::UniString text;
-                        if (elem.label.labelClass == APILblClass_Text && typeSpecificDetails->Get ("text", text)) {
-                            // Same content handling as CreateLabels (see the API_TextID case above).
-                            SetTextContentAndParagraphs (clipMemo, elem.label.u.text, text);
-                            ACAPI_ELEMENT_MASK_SET (mask, API_LabelType, u.text.nLine);
-                            ACAPI_ELEMENT_MASK_SET (mask, API_LabelType, u.text.useEolPos);
-                            ACAPI_ELEMENT_MASK_SET (mask, API_LabelType, u.text.nonBreaking);
-                            ACAPI_ELEMENT_MASK_SET (mask, API_LabelType, u.text.width);
-                            ACAPI_ELEMENT_MASK_SET (mask, API_LabelType, u.text.height);
-                            memoMask = APIMemoMask_TextContent | APIMemoMask_Paragraph;
-                            hasMemoChanges = true;
-                        }
-                    } break;
                     default:
                     break;
                 }
                 hasElementChanges = true;
             }
+
+            API_ElementMemo clipMemo = {};
+            UInt64 memoMask = 0;
+            bool hasMemoChanges = false;
 
             if (typeSpecificDetails != nullptr && GetElemTypeId (elem.header) == API_DrawingID) {
                 GS::Array<GS::ObjectState> clipCoords;
@@ -2179,11 +2129,6 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                     typeSpecificDetails->Get ("arcs", arcs);
                     GS::Array<GS::ObjectState> holes;
                     typeSpecificDetails->Get ("holes", holes);
-                    auto holesError = ValidateHoles (holes);
-                    if (holesError.HasValue ()) {
-                        executionResults (CreateFailedExecutionResult (APIERR_BADPARS, holesError.Get ()));
-                        continue;
-                    }
 
                     // Each contour: N unique coords -> N+1 stored coords (with closing duplicate).
                     Int32 totalUnique = (Int32) coordinates.GetSize ();
@@ -2304,49 +2249,107 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                                             memoMask, withDel);
                 ACAPI_DisposeElemMemoHdls (&clipMemo);
                 if (err != NoError) {
-                    executionResults (CreateFailedExecutionResult (err, "Failed to change element"));
+                    executionResults (CreateFailedExecutionResult (err, DescribeElementChangeFailure (err, "Failed to change element.")));
                     continue;
                 }
             }
 
             if (drwIndexTarget >= 0) {
                 GS::Array<API_Guid> guids = { elem.header.guid };
+                // Every ACAPI_Grouping_Tool call below previously had its GSErrCode discarded
+                // and this element was reported successful regardless of what actually happened
+                // in Archicad - drwIndex changes could silently fail (missing host, a rejected
+                // step, or a tool call that reported success without moving the element) and the
+                // caller had no way to know. Every branch now checks its own SDK call results and
+                // ends with a readback against the element's (or host's) actual drwIndex, so a
+                // silent no-op is reported as a failure instead of a false success.
+                bool drwIndexOk = true;
+                GS::UniString drwIndexFailure;
 
                 if (IsOpeningType (elem.header) && drwIndexTarget > 7) {
                     // Openings (Door/Window/Skylight) can only reach levels above 7 by
                     // temporarily elevating their host wall/roof step by step, then
                     // bringing it back the same way (BringToFront is unreliable on walls).
                     const API_Guid* hostGuidPtr = openingToHost.GetPtr (elem.header.guid);
-                    if (hostGuidPtr != nullptr) {
+                    if (hostGuidPtr == nullptr) {
+                        drwIndexOk = false;
+                        drwIndexFailure = "Opening has no locatable host element; draw index was not changed.";
+                    } else {
                         API_Element hostElem = {};
                         hostElem.header.guid = *hostGuidPtr;
-                        if (ACAPI_Element_Get (&hostElem) == NoError) {
+                        if (ACAPI_Element_Get (&hostElem) != NoError) {
+                            drwIndexOk = false;
+                            drwIndexFailure = "Host element could not be read; draw index was not changed.";
+                        } else {
                             const Int32 hostOriginal = (Int32) hostElem.header.drwIndex;
                             const Int32 target       = GS::Max (8, GS::Min ((Int32) drwIndexTarget, 14));
                             const Int32 steps        = target - hostOriginal;
                             GS::Array<API_Guid> hostGuids = { *hostGuidPtr };
                             if (steps > 0) {
                                 // Step host up — opening follows
-                                for (Int32 i = 0; i < steps; ++i)
-                                    ACAPI_Grouping_Tool (hostGuids, APITool_BringForward, nullptr);
+                                for (Int32 i = 0; i < steps && drwIndexOk; ++i) {
+                                    if (ACAPI_Grouping_Tool (hostGuids, APITool_BringForward, nullptr) != NoError) {
+                                        drwIndexOk = false;
+                                        drwIndexFailure = "Host could not be brought forward far enough; opening draw index change is incomplete.";
+                                    }
+                                }
                                 // Step host back down — opening stays elevated
-                                for (Int32 i = 0; i < steps; ++i)
-                                    ACAPI_Grouping_Tool (hostGuids, APITool_SendBackward, nullptr);
+                                for (Int32 i = 0; i < steps && drwIndexOk; ++i) {
+                                    if (ACAPI_Grouping_Tool (hostGuids, APITool_SendBackward, nullptr) != NoError) {
+                                        drwIndexOk = false;
+                                        drwIndexFailure = "Host could not be restored after elevating the opening; draw index change is incomplete.";
+                                    }
+                                }
+                                if (drwIndexOk) {
+                                    API_Elem_Head hostRecheck;
+                                    if (!LoadElementHeaderByGuid (*hostGuidPtr, hostRecheck) || (Int32) hostRecheck.drwIndex != hostOriginal) {
+                                        drwIndexOk = false;
+                                        drwIndexFailure = "Host draw index did not return to its original position; opening elevation is unconfirmed.";
+                                    }
+                                }
                             }
                         }
                     }
                 } else if (drwIndexTarget == 0 && IsOpeningType (elem.header)) {
                     // Reset elevated opening via its host (direct ResetOrder on opening doesn't work)
                     const API_Guid* hostGuidPtr = openingToHost.GetPtr (elem.header.guid);
-                    if (hostGuidPtr != nullptr) {
+                    if (hostGuidPtr == nullptr) {
+                        drwIndexOk = false;
+                        drwIndexFailure = "Opening has no locatable host element; draw index was not reset.";
+                    } else {
                         GS::Array<API_Guid> hostGuids = { *hostGuidPtr };
-                        ACAPI_Grouping_Tool (hostGuids, APITool_ResetOrder, nullptr);
+                        if (ACAPI_Grouping_Tool (hostGuids, APITool_ResetOrder, nullptr) != NoError) {
+                            drwIndexOk = false;
+                            drwIndexFailure = "Host draw order could not be reset; opening draw index was not reset.";
+                        }
                     }
                 } else if (drwIndexTarget == 0 && IsResetOrderReliable (elem.header)) {
-                    ACAPI_Grouping_Tool (guids, APITool_ResetOrder, nullptr);
+                    if (ACAPI_Grouping_Tool (guids, APITool_ResetOrder, nullptr) != NoError) {
+                        drwIndexOk = false;
+                        drwIndexFailure = "Draw order could not be reset to its class default.";
+                    } else {
+                        API_Elem_Head recheck;
+                        if (!LoadElementHeaderByGuid (elem.header.guid, recheck) || (Int32) recheck.drwIndex != GetDefaultDrwIndex (elem.header)) {
+                            drwIndexOk = false;
+                            drwIndexFailure = "Draw order reset call reported success but the element's draw index did not reach its class default.";
+                        }
+                    }
                 } else if (drwIndexTarget != 0 || !IsResetOrderReliable (elem.header)) {
                     const short resolvedTarget = (drwIndexTarget == 0) ? (short) GetDefaultDrwIndex (elem.header) : drwIndexTarget;
                     ApplyDrawIndexStrategy (guids, elem.header, (Int32) resolvedTarget, (Int32) elem.header.drwIndex);
+                    const Int32 clampedTarget = GS::Max (1, GS::Min ((Int32) resolvedTarget, 14));
+                    API_Elem_Head recheck;
+                    if (!LoadElementHeaderByGuid (elem.header.guid, recheck) || (Int32) recheck.drwIndex != clampedTarget) {
+                        drwIndexOk = false;
+                        drwIndexFailure = "Draw index could not be moved to the requested level.";
+                    }
+                }
+
+                if (!drwIndexOk) {
+                    executionResults (CreateFailedExecutionResult (APIERR_GENERAL, hasElementChanges || hasMemoChanges
+                        ? drwIndexFailure + " Other requested detail changes on this element were applied."
+                        : drwIndexFailure));
+                    continue;
                 }
             }
 
@@ -2356,6 +2359,9 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
         return NoError;
     });
 
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "SetDetails transaction failed; committed outcome is not confirmed.");
+    const auto& addResult = response.AddList<GS::ObjectState> ("executionResults");
+    for (const auto& result : resultsByInput) addResult (result);
     return response;
 }
 
@@ -2784,10 +2790,14 @@ GS::ObjectState GetConnectedElementsCommand::Execute (const GS::ObjectState& par
         GS::ObjectState elementsOS;
         const auto& elements = elementsOS.AddList<GS::ObjectState> ("elements");
         GS::Array<API_Guid> connectedElements;
-        if (ACAPI_Grouping_GetConnectedElements (ownerElemGuid, elemType, &connectedElements) == NoError) {
+        const GSErrCode connectionError = ACAPI_Grouping_GetConnectedElements (ownerElemGuid, elemType, &connectedElements);
+        if (connectionError == NoError) {
             for (const API_Guid& elem : connectedElements) {
                 elements (CreateElementIdObjectState (elem));
             }
+        } else {
+            connectedElementsOfInputElements (CreateErrorResponse (connectionError, "Cannot read native element connections."));
+            continue;
         }
 
         connectedElementsOfInputElements (elementsOS);
@@ -3128,16 +3138,12 @@ GS::Optional<GS::UniString> GetZoneBoundariesCommand::GetInputParametersSchema (
         "type": "object",
         "properties": {
             "zoneElementId": {
-                "$ref": "#/ElementId",
-                "description": "The identifier of a single Zone. Prefer the zones array: querying many Zones in one call is much faster than one call per Zone."
-            },
-            "zones": {
-                "$ref": "#/Elements",
-                "description": "A list of Zones. Only one of zoneElementId and zones can be given."
+                "$ref": "#/ElementId"
             }
         },
         "additionalProperties": false,
         "required": [
+            "zoneElementId"
         ]
     })";
 }
@@ -3145,30 +3151,46 @@ GS::Optional<GS::UniString> GetZoneBoundariesCommand::GetInputParametersSchema (
 GS::Optional<GS::UniString> GetZoneBoundariesCommand::GetRawResponseSchema () const
 {
     return R"({
-        "type": "object",
-        "oneOf": [
-            {
-                "$ref": "#/ZoneBoundariesOrError"
-            },
-            {
-                "$ref": "#/ZoneBoundariesOfZonesWrapper"
-            }
-        ]
+        "$ref": "#/ZoneBoundariesOrError"
     })";
 }
 
+GS::ObjectState GetZoneBoundariesCommand::Execute (
+    const GS::ObjectState& parameters,
 #ifdef ServerMainVers_2800
-
-static GS::ObjectState GetBoundariesOfZone (ACAPI::ZoneBoundaryQuery& query, const API_Guid& zoneGuid)
+    GS::ProcessControl& processControl) const
+#else
+    GS::ProcessControl& /*processControl*/) const
+#endif
 {
+    const GS::ObjectState* zoneElementId = parameters.Get ("zoneElementId");
+    if (zoneElementId == nullptr) {
+        return CreateErrorResponse (APIERR_BADPARS, "zoneElementId is missing");
+    }
+
+#ifdef ServerMainVers_2800
+    ACAPI::ZoneBoundaryQuery query = ACAPI::CreateZoneBoundaryQuery ();
+
+    ACAPI::Result updateResult = query.Modify (
+        [&] (ACAPI::ZoneBoundaryQuery::Modifier& modifier) -> GSErrCode {
+            ACAPI::Result<void> result = modifier.Update (processControl);
+            return result.IsOk () ? NoError : result.UnwrapErr ().kind;
+        }
+    );
+
+    if (updateResult.IsErr ()) {
+        return CreateErrorResponse (updateResult.UnwrapErr ().kind, "Failed to execute zone boundary query");
+    }
+
+    GS::ObjectState response;
+    const auto& zoneBoundaries = response.AddList<GS::ObjectState> ("zoneBoundaries");
+
+    const API_Guid zoneGuid = GetGuidFromObjectState (*zoneElementId);
     const ACAPI::Result<std::vector<ACAPI::ZoneBoundary>> boundaries = query.GetZoneBoundaries (zoneGuid);
 
     if (boundaries.IsErr ()) {
         return CreateErrorResponse (boundaries.UnwrapErr ().kind, "Failed to get zone boundary");
     }
-
-    GS::ObjectState zoneBoundariesOS;
-    const auto& zoneBoundaries = zoneBoundariesOS.AddList<GS::ObjectState> ("zoneBoundaries");
 
     for (const ACAPI::ZoneBoundary& boundary : boundaries.Unwrap ()) {
         GS::ObjectState boundaryOS;
@@ -3206,62 +3228,6 @@ static GS::ObjectState GetBoundariesOfZone (ACAPI::ZoneBoundaryQuery& query, con
         }
 
         zoneBoundaries (boundaryOS);
-    }
-
-    return zoneBoundariesOS;
-}
-
-#endif
-
-GS::ObjectState GetZoneBoundariesCommand::Execute (
-    const GS::ObjectState& parameters,
-#ifdef ServerMainVers_2800
-    GS::ProcessControl& processControl) const
-#else
-    GS::ProcessControl& /*processControl*/) const
-#endif
-{
-    const GS::ObjectState* zoneElementId = parameters.Get ("zoneElementId");
-    GS::Array<GS::ObjectState> zones;
-    const bool zonesGiven = parameters.Get ("zones", zones);
-
-    if (zoneElementId == nullptr && !zonesGiven) {
-        return CreateErrorResponse (APIERR_BADPARS, "One of zoneElementId and zones is required");
-    }
-
-    if (zoneElementId != nullptr && zonesGiven) {
-        return CreateErrorResponse (APIERR_BADPARS, "Only one of zoneElementId and zones can be given");
-    }
-
-#ifdef ServerMainVers_2800
-    ACAPI::ZoneBoundaryQuery query = ACAPI::CreateZoneBoundaryQuery ();
-
-    ACAPI::Result updateResult = query.Modify (
-        [&] (ACAPI::ZoneBoundaryQuery::Modifier& modifier) -> GSErrCode {
-            ACAPI::Result<void> result = modifier.Update (processControl);
-            return result.IsOk () ? NoError : result.UnwrapErr ().kind;
-        }
-    );
-
-    if (updateResult.IsErr ()) {
-        return CreateErrorResponse (updateResult.UnwrapErr ().kind, "Failed to execute zone boundary query");
-    }
-
-    if (zoneElementId != nullptr) {
-        return GetBoundariesOfZone (query, GetGuidFromObjectState (*zoneElementId));
-    }
-
-    GS::ObjectState response;
-    const auto& zoneBoundariesOfZones = response.AddList<GS::ObjectState> ("zoneBoundariesOfZones");
-
-    for (const GS::ObjectState& zone : zones) {
-        const GS::ObjectState* elementId = zone.Get ("elementId");
-        if (elementId == nullptr) {
-            zoneBoundariesOfZones (CreateErrorResponse (APIERR_BADPARS, "elementId is missing"));
-            continue;
-        }
-
-        zoneBoundariesOfZones (GetBoundariesOfZone (query, GetGuidFromObjectState (*elementId)));
     }
 
     return response;
@@ -3320,11 +3286,12 @@ GS::ObjectState UpdateZonesCommand::Execute (const GS::ObjectState& parameters, 
 
     GSErrCode err = NoError;
 
-    ACAPI_CallUndoableCommand ("UpdateZonesCommand", [&]() {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("UpdateZonesCommand", [&]() {
         err = ACAPI_Internal (APIInternal_UpdateRoomsID, &roomUpdateParams);
 
         return err;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return err == NoError
         ? CreateSuccessfulExecutionResult ()
@@ -3572,7 +3539,7 @@ GS::ObjectState	MoveElementsCommand::Execute (const GS::ObjectState& parameters,
     GS::ObjectState response;
     const auto& executionResults = response.AddList<GS::ObjectState> ("executionResults");
 
-    ACAPI_CallUndoableCommand ("Move Elements", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("Move Elements", [&]() -> GSErrCode {
         for (const GS::ObjectState& elementWithMoveVector : elementsWithMoveVectors) {
             const GS::ObjectState* elementId = elementWithMoveVector.Get ("elementId");
             if (elementId == nullptr) {
@@ -3604,6 +3571,7 @@ GS::ObjectState	MoveElementsCommand::Execute (const GS::ObjectState& parameters,
 
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 }
@@ -3723,7 +3691,7 @@ GS::ObjectState RotateElementsCommand::Execute (const GS::ObjectState& parameter
     GS::ObjectState response;
     const auto& executionResults = response.AddList<GS::ObjectState> ("executionResults");
 
-    ACAPI_CallUndoableCommand ("Rotate Elements", [&]() -> GSErrCode {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("Rotate Elements", [&]() -> GSErrCode {
         for (const GS::ObjectState& elementWithRotation : elementsWithRotations) {
             const GS::ObjectState* elementId = elementWithRotation.Get ("elementId");
             if (elementId == nullptr) {
@@ -3765,6 +3733,7 @@ GS::ObjectState RotateElementsCommand::Execute (const GS::ObjectState& parameter
 
         return NoError;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return response;
 }
@@ -3991,6 +3960,15 @@ GS::ObjectState HighlightElementsCommand::Execute (const GS::ObjectState& /*para
 #endif
 
 
+static API_Coord3D TransformPoint (const API_Coord3D& pt, const API_Tranmat& tm)
+{
+    API_Coord3D res;
+    res.x = (pt.x * tm.tmx[0]) + (pt.y * tm.tmx[1]) + (pt.z * tm.tmx[2]) + tm.tmx[3];
+    res.y = (pt.x * tm.tmx[4]) + (pt.y * tm.tmx[5]) + (pt.z * tm.tmx[6]) + tm.tmx[7];
+    res.z = (pt.x * tm.tmx[8]) + (pt.y * tm.tmx[9]) + (pt.z * tm.tmx[10]) + tm.tmx[11];
+    return res;
+}
+
 static void UpdateGlobalBoundsWithPoint (API_Box3D& globalBounds, const API_Coord3D& pt)
 {
     if (pt.x < globalBounds.xMin) globalBounds.xMin = pt.x;
@@ -4001,21 +3979,30 @@ static void UpdateGlobalBoundsWithPoint (API_Box3D& globalBounds, const API_Coor
     if (pt.z > globalBounds.zMax) globalBounds.zMax = pt.z;
 }
 
-static void InitializeEmptyBounds (API_Box3D& bounds)
+static void GetLocalBodyCorners (const API_BodyType& body, API_Coord3D (&corners)[8])
 {
-    bounds.xMin = bounds.yMin = bounds.zMin = 1e30;
-    bounds.xMax = bounds.yMax = bounds.zMax = -1e30;
+    corners[0] = { body.xmin, body.ymin, body.zmin };
+    corners[1] = { body.xmax, body.ymin, body.zmin };
+    corners[2] = { body.xmin, body.ymax, body.zmin };
+    corners[3] = { body.xmax, body.ymax, body.zmin };
+    corners[4] = { body.xmin, body.ymin, body.zmax };
+    corners[5] = { body.xmax, body.ymin, body.zmax };
+    corners[6] = { body.xmin, body.ymax, body.zmax };
+    corners[7] = { body.xmax, body.ymax, body.zmax };
 }
 
-// Extends bounds with the solid 3D bodies of the element. foundSolidBody is only ever set to
-// true here, so the same accumulator can be run over several elements in a row.
-static GSErrCode AccumulateSolidBodyBounds (const API_Elem_Head& elemHead, API_Box3D& bounds, bool& foundSolidBody)
+static GSErrCode CalculateSolidBodyBounds (const API_Elem_Head& elemHead, API_Box3D& outBounds)
 {
+    outBounds.xMin = outBounds.yMin = outBounds.zMin = 1e30;
+    outBounds.xMax = outBounds.yMax = outBounds.zMax = -1e30;
+
     API_ElemInfo3D info3D = {};
     GSErrCode err = ACAPI_ModelAccess_Get3DInfo (elemHead, &info3D);
     if (err != NoError) {
         return err;
     }
+
+    bool foundSolidBody = false;
 
     for (Int32 iBody = info3D.fbody; iBody <= info3D.lbody; ++iBody) {
         API_Component3D bodyComp = {};
@@ -4030,65 +4017,13 @@ static GSErrCode AccumulateSolidBodyBounds (const API_Elem_Head& elemHead, API_B
 
         foundSolidBody = true;
 
-        // body.xmin..zmax is the body's bounding box in world coordinates: measured on a
-        // live model it equals the min/max of the body's vertices *after* they are
-        // transformed by body.tranmat. Applying tranmat to it again adds the placement a
-        // second time, which is what made a stair report twice its height (#563). It went
-        // unnoticed for Roofs and Zones only because their tranmat is the identity.
-        UpdateGlobalBoundsWithPoint (bounds, API_Coord3D { bodyComp.body.xmin, bodyComp.body.ymin, bodyComp.body.zmin });
-        UpdateGlobalBoundsWithPoint (bounds, API_Coord3D { bodyComp.body.xmax, bodyComp.body.ymax, bodyComp.body.zmax });
-    }
+        API_Coord3D corners[8];
+        GetLocalBodyCorners (bodyComp.body, corners);
 
-    return NoError;
-}
-
-static GSErrCode CalculateSolidBodyBounds (const API_Elem_Head& elemHead, API_Box3D& outBounds)
-{
-    InitializeEmptyBounds (outBounds);
-
-    bool foundSolidBody = false;
-    GSErrCode err = AccumulateSolidBodyBounds (elemHead, outBounds, foundSolidBody);
-    if (err != NoError) {
-        return err;
-    }
-
-    if (!foundSolidBody) {
-        return APIERR_GENERAL;
-    }
-
-    return NoError;
-}
-
-template<typename APIElemType>
-static void AccumulateSubelementBounds (APIElemType* subelemArray, API_Box3D& bounds, bool& foundSolidBody)
-{
-    if (subelemArray == nullptr) {
-        return;
-    }
-
-    const GSSize nSubelements = BMGetPtrSize (reinterpret_cast<GSPtr>(subelemArray)) / sizeof (APIElemType);
-    for (GSIndex i = 0; i < nSubelements; ++i) {
-        AccumulateSolidBodyBounds (subelemArray[i].head, bounds, foundSolidBody);
-    }
-}
-
-// A Stair carries its 3D geometry in its subelements (risers, treads and structures), so neither
-// ACAPI_Element_CalcBounds nor the 3D model of the Stair element itself gives back the vertical
-// extent of the flight - both answer with zMin == zMax == 0 (#563). The bounds are the union of
-// the solid bodies of the Stair and of all of its subelements.
-static GSErrCode CalculateStairBounds (const API_Elem_Head& stairElemHead, API_Box3D& outBounds)
-{
-    InitializeEmptyBounds (outBounds);
-
-    bool foundSolidBody = false;
-    AccumulateSolidBodyBounds (stairElemHead, outBounds, foundSolidBody);
-
-    API_ElementMemo memo = {};
-    const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
-    if (ACAPI_Element_GetMemo (stairElemHead.guid, &memo, APIMemoMask_All) == NoError) {
-        AccumulateSubelementBounds (memo.stairRisers, outBounds, foundSolidBody);
-        AccumulateSubelementBounds (memo.stairTreads, outBounds, foundSolidBody);
-        AccumulateSubelementBounds (memo.stairStructures, outBounds, foundSolidBody);
+        for (int k = 0; k < 8; ++k) {
+            const API_Coord3D globalPt = TransformPoint (corners[k], bodyComp.body.tranmat);
+            UpdateGlobalBoundsWithPoint (outBounds, globalPt);
+        }
     }
 
     if (!foundSolidBody) {
@@ -4167,13 +4102,6 @@ GS::ObjectState Get3DBoundingBoxesCommand::Execute (const GS::ObjectState& param
         API_Box3D box3D = {};
         if (typeID == API_RoofID || typeID == API_ZoneID) {
             err = CalculateSolidBodyBounds (elemHead, box3D);
-        } else if (typeID == API_StairID) {
-            err = CalculateStairBounds (elemHead, box3D);
-            if (err != NoError) {
-                // The Stair has no solid body at all - for example it is filtered out of the 3D
-                // model - so fall back to the old answer instead of failing the whole element.
-                err = ACAPI_Element_CalcBounds (&elemHead, &box3D);
-            }
         } else {
             err = ACAPI_Element_CalcBounds (&elemHead, &box3D);
         }
@@ -4211,6 +4139,10 @@ GS::Optional<GS::UniString> DeleteElementsCommand::GetInputParametersSchema () c
         "properties": {
             "elements": {
                 "$ref": "#/Elements"
+            },
+            "allowGroupDeletion": {
+                "type": "boolean",
+                "description": "Archicad automatically extends a delete to every other member of a group if any requested element belongs to one (unless Suspend Groups is on) - this can silently delete far more than requested. False by default: any requested element that belongs to a group is refused and nothing is deleted. Set true only when deleting the whole group is actually intended."
             }
         },
         "additionalProperties": false,
@@ -4231,18 +4163,79 @@ GS::ObjectState DeleteElementsCommand::Execute (const GS::ObjectState& parameter
 {
     GS::Array<GS::ObjectState> elements;
     parameters.Get ("elements", elements);
+    if (elements.IsEmpty ())
+        return CreateErrorResponse (APIERR_BADPARS, "Supply at least one element.");
+
+    bool allowGroupDeletion = false;
+    parameters.Get ("allowGroupDeletion", allowGroupDeletion);
+
+    // Validate every requested element BEFORE deleting anything, all-or-nothing: a
+    // missing/invalid elementId used to silently resolve to APINULLGuid and still get
+    // passed into ACAPI_Element_Delete's array with no check at all. Worse, that
+    // function's own documented behaviour automatically extends the delete to every
+    // other member of a group if any target belongs to one (unless Suspend Groups is
+    // on) - confirmed live to be able to sweep away far more than requested, with no
+    // warning. Refusing upfront, and requiring an explicit opt-in for the group case,
+    // matches every other command this session: never silently do more than asked.
+    GS::Array<API_Guid> guids;
+    for (const auto& item : elements) {
+        const API_Guid guid = GetGuidFromElementsArrayItem (item);
+        if (guid == APINULLGuid) {
+            return CreateErrorResponse (APIERR_BADPARS, "One or more elements has a missing or invalid elementId; nothing was deleted.");
+        }
+        API_Elem_Head head = {};
+        head.guid = guid;
+        const GSErrCode headerErr = ACAPI_Element_GetHeader (&head);
+        if (headerErr != NoError) {
+            return CreateErrorResponse (headerErr, GS::UniString ("An element does not exist or cannot be read (guid ") + APIGuidToString (guid) + "); nothing was deleted.");
+        }
+        if (!allowGroupDeletion) {
+            API_Guid groupGuid = APINULLGuid;
+            const GSErrCode groupErr = ACAPI_Grouping_GetGroup (guid, &groupGuid);
+            if (groupErr == NoError && groupGuid != APINULLGuid) {
+                return CreateErrorResponse (APIERR_GENERAL, GS::UniString ("An element (guid ") + APIGuidToString (guid) +
+                    ") is part of a group; deleting it would delete every other member of that group too. Nothing was deleted. Set allowGroupDeletion:true to proceed anyway.");
+            }
+        }
+        guids.Push (guid);
+    }
 
     GSErrCode err = NoError;
 
-    ACAPI_CallUndoableCommand ("DeleteElementsCommand", [&]() {
-        err = ACAPI_Element_Delete (elements.Transform<API_Guid> (GetGuidFromElementsArrayItem));
+    const GSErrCode transaction = ACAPI_CallUndoableCommand ("DeleteElementsCommand", [&]() {
+        err = ACAPI_Element_Delete (guids);
 
         return err;
     });
 
-    return err == NoError
-        ? CreateSuccessfulExecutionResult ()
-        : CreateFailedExecutionResult (err, "Failed to delete elements.");
+    if (transaction != NoError)
+        return CreateFailedExecutionResult (transaction, "Element deletion transaction failed; deletion is not confirmed.");
+
+    if (err != NoError)
+        return CreateFailedExecutionResult (err, "Failed to delete elements.");
+
+    // ACAPI_Element_Delete returning NoError does not guarantee anything was actually
+    // deleted - confirmed live that it silently no-ops (no error, nothing removed) for
+    // at least one real case: an element on a hidden layer. Read every target back; if
+    // any of them still resolve, the delete did not really happen for that one, same
+    // "verify before trusting the SDK's own return code" principle applied everywhere
+    // else this session.
+    for (const API_Guid& guid : guids) {
+        API_Elem_Head head = {};
+        head.guid = guid;
+        if (ACAPI_Element_GetHeader (&head) != NoError) continue; // genuinely gone, as expected
+        GS::UniString reason = "it still exists after the delete call reported no error";
+        API_Attribute layerAttr = {};
+        layerAttr.header.typeID = API_LayerID;
+        layerAttr.header.index = head.layer;
+        if (ACAPI_Attribute_Get (&layerAttr) == NoError && (layerAttr.header.flags & APILay_Hidden) != 0) {
+            reason = "it is on a hidden layer; Archicad silently refuses to delete elements on a hidden layer via the API instead of returning an error. Unhide the layer first, or delete it manually in Archicad";
+        }
+        return CreateErrorResponse (APIERR_GENERAL, GS::UniString ("An element (guid ") + APIGuidToString (guid) +
+            ") was not actually deleted even though the delete call succeeded - " + reason + ".");
+    }
+
+    return CreateSuccessfulExecutionResult ();
 }
 
 LockElementsCommand::LockElementsCommand () :
@@ -4285,10 +4278,11 @@ GS::ObjectState LockElementsCommand::Execute (const GS::ObjectState& parameters,
 
     GSErrCode err = NoError;
 
-    ACAPI_CallUndoableCommand ("LockElementsCommand", [&]() {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("LockElementsCommand", [&]() {
         err = ACAPI_Grouping_Tool (elements.Transform<API_Guid> (GetGuidFromElementsArrayItem), APITool_Lock, nullptr);
         return err;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return err == NoError
         ? CreateSuccessfulExecutionResult ()
@@ -4335,10 +4329,11 @@ GS::ObjectState UnlockElementsCommand::Execute (const GS::ObjectState& parameter
 
     GSErrCode err = NoError;
 
-    ACAPI_CallUndoableCommand ("UnlockElementsCommand", [&]() {
+    const GSErrCode transactionError = ACAPI_CallUndoableCommand ("UnlockElementsCommand", [&]() {
         err = ACAPI_Grouping_Tool (elements.Transform<API_Guid> (GetGuidFromElementsArrayItem), APITool_Unlock, nullptr);
         return err;
     });
+    if (transactionError != NoError) return CreateErrorResponse (transactionError, "Native transaction failed; committed changes are not confirmed.");
 
     return err == NoError
         ? CreateSuccessfulExecutionResult ()
@@ -4483,11 +4478,13 @@ GS::Optional<GS::UniString> GetRoomImageCommand::GetInputParametersSchema () con
             },
             "width": {
                 "type": "integer",
-                "description": "The width of the preview image in pixels. Default is 256."
+                "description": "The width of the preview image in pixels. Default is 256.",
+                "minimum": 1, "maximum": 4096
             },
             "height": {
                 "type": "integer",
-                "description": "The height of the preview image in pixels. Default is 256."
+                "description": "The height of the preview image in pixels. Default is 256.",
+                "minimum": 1, "maximum": 4096
             },
             "offset": {
                 "type": "number",
@@ -4495,7 +4492,8 @@ GS::Optional<GS::UniString> GetRoomImageCommand::GetInputParametersSchema () con
             },
             "scale": {
                 "type": "number",
-                "description": "Scale of the view (e.g. 0.005 for 1:200). Default is 0.005."
+                "description": "Scale of the view (e.g. 0.005 for 1:200). Default is 0.005.",
+                "exclusiveMinimum": 0
             },
             "backgroundColor": {
                 "$ref": "#/ColorRGB",
@@ -4517,6 +4515,17 @@ GS::Optional<GS::UniString> GetRoomImageCommand::GetRawResponseSchema () const
             "roomImage": {
                 "type": "string",
                 "description": "The base64 encoded room image."
+            },
+            "imageContext": {
+                "type":"object","properties":{
+                    "zoneId":{"$ref":"#/ElementId"},"widthPixels":{"type":"integer"},
+                    "heightPixels":{"type":"integer"},"mimeType":{"type":"string"},
+                    "scale":{"type":"number"},"clipOffsetMetres":{"type":"number"},
+                    "source":{"const":"ACAPI_Element_GetRoomImage / APIImage_Model2D"},
+                    "modificationStamp":{"type":"string"},"floorIndex":{"type":"integer"},
+                    "pixelToProjectMappingAvailable":{"const":false}
+                },"additionalProperties":false,
+                "required":["zoneId","widthPixels","heightPixels","mimeType","scale","clipOffsetMetres","source","modificationStamp","floorIndex","pixelToProjectMappingAvailable"]
             }
         },
         "additionalProperties": false,
@@ -4531,6 +4540,10 @@ GS::ObjectState GetRoomImageCommand::Execute (const GS::ObjectState& parameters,
     API_RoomImage image = {};
     image.roomGuid = GetGuidFromArrayItem ("zoneId", parameters);
     image.viewType = APIImage_Model2D;
+    API_Element zone = {}; zone.header.guid = image.roomGuid;
+    const GSErrCode zoneError = ACAPI_Element_Get (&zone);
+    if (zoneError != NoError) return CreateErrorResponse (zoneError, "Cannot read the requested image zone.");
+    if (GetElemTypeId (zone.header) != API_ZoneID) return CreateErrorResponse (APIERR_BADPARS, "Room image requires a Zone element.");
 
     NewDisplay::NativeImage::Encoding encoding = NewDisplay::NativeImage::Encoding::PNG;
     GS::UniString formatStr;
@@ -4554,6 +4567,9 @@ GS::ObjectState GetRoomImageCommand::Execute (const GS::ObjectState& parameters,
 
     image.scale = 0.005;
     parameters.Get ("scale", image.scale);
+    if (width < 1 || width > 4096 || height < 1 || height > 4096 ||
+        !std::isfinite (image.scale) || image.scale <= 0 || !std::isfinite (image.offset))
+        return CreateErrorResponse (APIERR_BADPARS, "Image dimensions must be 1 to 4096 pixels, scale positive and clip offset finite.");
 
     image.backgroundColor = {1.0, 1.0, 1.0};
     GetColor(parameters, "backgroundColor", image.backgroundColor);
@@ -4572,6 +4588,719 @@ GS::ObjectState GetRoomImageCommand::Execute (const GS::ObjectState& parameters,
 
     auto str = Base64Converter::Encode (memChannel.GetDestination (), memChannel.GetDataSize ());
     str.DeleteAll (GS::UniChar(char('\n')));
-    return GS::ObjectState ("roomImage", str);
+    GS::ObjectState context ("zoneId", CreateGuidObjectState (image.roomGuid),
+        "widthPixels", width, "heightPixels", height,
+        "mimeType", encoding == NewDisplay::NativeImage::Encoding::PNG ? "image/png" : "image/jpeg",
+        "scale", image.scale, "clipOffsetMetres", image.offset,
+        "source", "ACAPI_Element_GetRoomImage / APIImage_Model2D",
+        "modificationStamp", GS::UniString (std::to_string (zone.header.modiStamp).c_str ()),
+        "floorIndex", zone.header.floorInd, "pixelToProjectMappingAvailable", false);
+    return GS::ObjectState ("roomImage", str, "imageContext", context);
 }
 
+
+// A bounded scan of the current database. Offsets are positions in the sorted
+// candidate list, not result counts. Restart pagination after project edits.
+GS::Optional<GS::UniString> GetElementContextCommand::GetInputParametersSchema () const
+{
+    return R"({"type":"object","properties":{
+        "elementType":{"$ref":"#/ElementType"},
+        "floorIndex":{"type":"integer"},"layerIndex":{"type":"integer"},
+        "zoneId":{"$ref":"#/ElementId","description":"Restrict candidates to native zone relations, not inferred containment. Requires AC26+; zone and elements are read in the current database."},
+        "propertyFilters":{"type":"array","minItems":1,"maxItems":16,"description":"All predicates must match. Only scalar string, boolean, integer and real properties; no display-string or enum comparison. Unavailable/undefined values do not match, including NotEquals. Numeric values use the property's native API units.","items":{
+            "type":"object","properties":{"propertyId":{"$ref":"#/PropertyId"},
+                "operator":{"type":"string","enum":["Equals","NotEquals","GreaterThan","LessThan"]},
+                "value":{"type":["string","boolean","number"]},
+                "tolerance":{"type":"number","minimum":0,"description":"Numeric equality tolerance, default zero. Ordering comparisons ignore the equality band only by rejecting this field."}},
+            "required":["propertyId","operator","value"],"additionalProperties":false,
+            "allOf":[{"if":{"properties":{"operator":{"enum":["GreaterThan","LessThan"]}},"required":["operator"]},
+                "then":{"properties":{"value":{"type":"number"}},"not":{"required":["tolerance"]}}},
+                {"if":{"required":["tolerance"]},"then":{"properties":{"value":{"type":"number"}}}}]
+        }},
+        "nativeFieldFilters":{"type":"array","minItems":1,"maxItems":16,"description":"All predicates must match. Native struct fields (dimensions, offsets, etc.), not Property Manager properties - use propertyFilters for those. Field availability depends on elementType; an unsupported name is rejected with the supported list for that type.","items":{
+            "type":"object","properties":{"field":{"type":"string"},
+                "operator":{"type":"string","enum":["Equals","NotEquals","GreaterThan","LessThan"]},
+                "value":{"type":"number"},
+                "tolerance":{"type":"number","minimum":0,"description":"Equality tolerance, default zero. Ordering comparisons ignore the equality band only by rejecting this field."}},
+            "required":["field","operator","value"],"additionalProperties":false,
+            "allOf":[{"if":{"properties":{"operator":{"enum":["GreaterThan","LessThan"]}},"required":["operator"]},"then":{"not":{"required":["tolerance"]}}}]
+        }},
+        "classificationItemId":{"type":"object","properties":{"guid":{"type":"string","format":"uuid"}},"required":["guid"],"additionalProperties":false,"description":"Exact directly assigned classification item, not descendants."},
+        "renovationStatus":{"type":"string","enum":["Existing","New","Demolished"]},
+        "offset":{"type":"integer","minimum":0},
+        "limit":{"type":"integer","minimum":1,"maximum":100},
+        "scanLimit":{"type":"integer","minimum":1,"maximum":1000},
+        "includeDetails":{"type":"boolean"},
+        "includeBounds":{"type":"boolean","description":"Return native axis-aligned project bounds in metres for each selected element."},
+        "bounds3D":{"type":"object","description":"Native bounding-box overlap in project metres, not exact solid intersection.","properties":{
+            "xMin":{"type":"number"},"yMin":{"type":"number"},"zMin":{"type":"number"},
+            "xMax":{"type":"number"},"yMax":{"type":"number"},"zMax":{"type":"number"}
+        },"required":["xMin","yMin","zMin","xMax","yMax","zMax"],"additionalProperties":false},
+        "bounds2D":{"type":"object","description":"Axis-aligned project XY region in metres; native bounding-box overlap, not exact geometry intersection.","properties":{
+            "xMin":{"type":"number"},"yMin":{"type":"number"},"xMax":{"type":"number"},"yMax":{"type":"number"}
+        },"required":["xMin","yMin","xMax","yMax"],"additionalProperties":false}
+    },"required":["elementType"],"additionalProperties":false,"not":{"required":["bounds2D","bounds3D"]}})";
+}
+
+GS::Optional<GS::UniString> GetElementContextCommand::GetRawResponseSchema () const
+{
+    return R"({"type":"object","properties":{
+        "elements":{"type":"array","items":{"type":"object","properties":{
+            "elementId":{"$ref":"#/ElementId"},"type":{"type":"string"},
+            "floorIndex":{"type":"integer"},"layerIndex":{"type":"integer"},"modificationStamp":{"type":"string"},
+            "bounds3D":{"type":"object","properties":{"xMin":{"type":"number"},"yMin":{"type":"number"},"zMin":{"type":"number"},
+                "xMax":{"type":"number"},"yMax":{"type":"number"},"zMax":{"type":"number"}},
+                "required":["xMin","yMin","zMin","xMax","yMax","zMax"],"additionalProperties":false}
+        },"required":["elementId","type","floorIndex","layerIndex"],"additionalProperties":false}},
+        "details":{"type":"object"},"errors":{"type":"array","items":{"type":"object"}},
+        "candidateCount":{"type":"integer"},"scannedCount":{"type":"integer"},
+        "nextOffset":{"type":"integer"},"hasMore":{"type":"boolean"},
+        "scope":{"type":"string"},"pagination":{"type":"string"},"databaseId":{"$ref":"#/DatabaseId"},
+        "candidateSource":{"type":"string","enum":["NativeTypeEnumeration","NativeZoneRelations"]},"boundsUnits":{"const":"metres"}
+    },"required":["elements","errors","candidateCount","scannedCount","nextOffset","hasMore","scope","pagination"],"additionalProperties":false})";
+}
+
+GS::ObjectState GetElementContextCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const
+{
+    GS::UniString typeName;
+    parameters.Get ("elementType", typeName);
+    const API_ElemTypeID type = GetElementTypeFromNonLocalizedName (typeName);
+    if (type == API_ZombieElemID)
+        return CreateErrorResponse (APIERR_BADPARS, "A valid elementType is required.");
+    API_DatabaseInfo currentDatabase = {};
+    const GSErrCode databaseError = ACAPI_Database_GetCurrentDatabase (&currentDatabase);
+    if (databaseError != NoError) return CreateErrorResponse (databaseError, "Cannot establish query database context.");
+    GS::Array<GS::ObjectState> propertyFilters;
+    parameters.Get ("propertyFilters", propertyFilters);
+    if (propertyFilters.GetSize () > 16) return CreateErrorResponse (APIERR_BADPARS, "At most 16 property predicates are supported.");
+    GS::Array<API_Guid> propertyIds;
+    for (const auto& filter : propertyFilters) {
+        API_PropertyDefinition definition;
+        definition.guid = GetGuidFromArrayItem ("propertyId", filter);
+        const GSErrCode definitionError = ACAPI_Property_GetPropertyDefinition (definition);
+        if (definitionError != NoError) return CreateErrorResponse (definitionError, "Cannot resolve property filter definition.");
+        if (definition.collectionType != API_PropertySingleCollectionType)
+            return CreateErrorResponse (APIERR_NOTSUPPORTED, "Property predicates require scalar properties; lists and enumerations are not compared as display strings.");
+        GS::UniString operation, textValue; bool boolValue = false; Int32 intValue = 0; double numberValue = 0, tolerance = 0;
+        filter.Get ("operator", operation); filter.Get ("tolerance", tolerance);
+        const bool ordered = operation == "GreaterThan" || operation == "LessThan";
+        if ((operation != "Equals" && operation != "NotEquals" && !ordered) || !std::isfinite (tolerance) || tolerance < 0 || (ordered && filter.Contains ("tolerance")))
+            return CreateErrorResponse (APIERR_BADPARS, "Invalid property operator or tolerance.");
+        bool valid = false;
+        switch (definition.valueType) {
+            case API_PropertyStringValueType: valid = filter.Get ("value", textValue) && !ordered && !filter.Contains ("tolerance"); break;
+            case API_PropertyBooleanValueType: valid = filter.Get ("value", boolValue) && !ordered && !filter.Contains ("tolerance"); break;
+            case API_PropertyIntegerValueType: valid = filter.Get ("value", intValue); break;
+            case API_PropertyRealValueType: valid = filter.Get ("value", numberValue) && std::isfinite (numberValue); break;
+            default: break;
+        }
+        if (!valid) return CreateErrorResponse (APIERR_BADPARS, "Property predicate value/operator does not match the native scalar type.");
+        propertyIds.Push (definition.guid);
+    }
+
+    GS::Array<GS::ObjectState> nativeFieldFilters;
+    parameters.Get ("nativeFieldFilters", nativeFieldFilters);
+    if (nativeFieldFilters.GetSize () > 16) return CreateErrorResponse (APIERR_BADPARS, "At most 16 native field predicates are supported.");
+    std::vector<double (*) (const API_Element&)> nativeFieldReaders;
+    for (const auto& filter : nativeFieldFilters) {
+        GS::UniString fieldName, operation; double tolerance = 0;
+        filter.Get ("field", fieldName); filter.Get ("operator", operation); filter.Get ("tolerance", tolerance);
+        const bool ordered = operation == "GreaterThan" || operation == "LessThan";
+        if ((operation != "Equals" && operation != "NotEquals" && !ordered) || !std::isfinite (tolerance) || tolerance < 0 || (ordered && filter.Contains ("tolerance")))
+            return CreateErrorResponse (APIERR_BADPARS, "Invalid native field operator or tolerance.");
+        double value = 0;
+        if (!filter.Get ("value", value) || !std::isfinite (value))
+            return CreateErrorResponse (APIERR_BADPARS, "Native field predicate value must be a finite number.");
+        const auto reader = FindNativeFieldFilterReader (type, fieldName);
+        if (reader == nullptr) {
+            const GS::UniString available = ListNativeFieldFilterNames (type);
+            return CreateErrorResponse (APIERR_BADPARS, GS::UniString ("Unsupported nativeFieldFilters field '") + fieldName + "' for elementType '" + typeName + "'. " +
+                (available.IsEmpty () ? GS::UniString ("No native fields are filterable for this type.") : GS::UniString ("Supported fields: ") + available + "."));
+        }
+        nativeFieldReaders.push_back (reader);
+    }
+
+    Int32 offset = 0, limit = 50, scanLimit = 500, floor = 0, layer = 0;
+    parameters.Get ("offset", offset);
+    parameters.Get ("limit", limit);
+    parameters.Get ("scanLimit", scanLimit);
+    const bool filterFloor = parameters.Get ("floorIndex", floor);
+    const bool filterLayer = parameters.Get ("layerIndex", layer);
+    GS::UniString renovation;
+    const bool filterRenovation = parameters.Get ("renovationStatus", renovation);
+    if (filterRenovation && renovation != "Existing" && renovation != "New" && renovation != "Demolished")
+        return CreateErrorResponse (APIERR_BADPARS, "Unknown renovation status.");
+    const API_RenovationStatusType desiredRenovation = renovation == "Existing" ? API_ExistingStatus : renovation == "New" ? API_NewStatus : API_DemolishedStatus;
+    const auto* classification = parameters.Get ("classificationItemId");
+    API_Guid classificationGuid = APINULLGuid;
+    if (classification != nullptr) {
+        classificationGuid = GetGuidFromObjectState (*classification);
+        API_ClassificationItem definition = {}; definition.guid = classificationGuid;
+        const GSErrCode classificationError = ACAPI_Classification_GetClassificationItem (definition);
+        if (classificationError != NoError) return CreateErrorResponse (classificationError, "Classification filter item is unavailable in this project.");
+    }
+    bool includeDetails = false;
+    parameters.Get ("includeDetails", includeDetails);
+    bool includeBounds = false; parameters.Get ("includeBounds", includeBounds);
+    if (offset < 0 || limit < 1 || limit > 100 || scanLimit < 1 || scanLimit > 1000)
+        return CreateErrorResponse (APIERR_BADPARS, "Invalid pagination limits.");
+    const GS::ObjectState* bounds = parameters.Get ("bounds2D");
+    const bool boundsAre3D = parameters.Contains ("bounds3D");
+    if (bounds != nullptr && boundsAre3D) return CreateErrorResponse (APIERR_BADPARS, "Choose bounds2D or bounds3D, not both.");
+    if (boundsAre3D) bounds = parameters.Get ("bounds3D");
+    double xMin = 0, yMin = 0, xMax = 0, yMax = 0, zMin = 0, zMax = 0;
+    if (bounds != nullptr) {
+        if (!bounds->Get ("xMin", xMin) || !bounds->Get ("yMin", yMin) || !bounds->Get ("xMax", xMax) || !bounds->Get ("yMax", yMax) ||
+            !std::isfinite (xMin) || !std::isfinite (yMin) || !std::isfinite (xMax) || !std::isfinite (yMax) || xMax < xMin || yMax < yMin)
+            return CreateErrorResponse (APIERR_BADPARS, "Invalid bounds2D region.");
+        if (boundsAre3D && (!bounds->Get ("zMin", zMin) || !bounds->Get ("zMax", zMax) || !std::isfinite (zMin) || !std::isfinite (zMax) || zMax < zMin))
+            return CreateErrorResponse (APIERR_BADPARS, "Invalid bounds3D height interval.");
+    }
+    GS::Array<API_Guid> nativeIds;
+    const auto* zoneId = parameters.Get ("zoneId");
+    if (zoneId != nullptr) {
+#ifdef ServerMainVers_2600
+        API_Elem_Head zone = {}; zone.guid = GetGuidFromObjectState (*zoneId);
+        GSErrCode err = ACAPI_Element_GetHeader (&zone);
+        if (err != NoError) return CreateErrorResponse (err, "Cannot read query zone.");
+        if (GetElemTypeId (zone) != API_ZoneID) return CreateErrorResponse (APIERR_BADPARS, "zoneId must identify a native zone.");
+        API_RoomRelation relation = {};
+        const GS::OnExit cleanup ([&] () { ACAPI_DisposeRoomRelationHdls (&relation); });
+        err = ACAPI_Element_GetRelations (zone.guid, API_ElemType (type), &relation);
+        if (err != NoError) return CreateErrorResponse (err, "Cannot query native zone relations for this element type.");
+        GS::HashSet<API_Guid> seen;
+        relation.elementsGroupedByType.Enumerate ([&] (const API_ElemType& relatedType, const GS::Array<API_Guid>& relatedIds) {
+            if (relatedType.typeID != type) return;
+            for (const auto& id : relatedIds) if (!seen.Contains (id)) { nativeIds.Push (id); seen.Add (id); }
+        });
+#else
+        return CreateErrorResponse (APIERR_NOTSUPPORTED, "Native zone relation filtering requires AC26 or newer.");
+#endif
+    } else {
+        const GSErrCode err = ACAPI_Element_GetElemList (type, &nativeIds);
+        if (err != NoError) return CreateErrorResponse (err, "Cannot enumerate the current database.");
+    }
+    std::vector<API_Guid> ids;
+    for (const auto& guid : nativeIds) ids.push_back (guid);
+    std::sort (ids.begin (), ids.end (), [](const API_Guid& a, const API_Guid& b) {
+        return APIGuidToString (a) < APIGuidToString (b);
+    });
+    GS::ObjectState response ("scope", "CurrentDatabase", "pagination", "SortedGuidOffsetRestartAfterEdits");
+    response.Add ("databaseId", CreateGuidObjectState (DatabaseIdResolver::Instance ().GetIdOfDatabase (currentDatabase)));
+    response.Add ("candidateSource", zoneId != nullptr ? "NativeZoneRelations" : "NativeTypeEnumeration");
+    response.Add ("boundsUnits", "metres");
+    const auto& add = response.AddList<GS::ObjectState> ("elements");
+    const auto& addError = response.AddList<GS::ObjectState> ("errors");
+    GS::Array<GS::ObjectState> selected;
+    Int32 cursor = offset, scanned = 0;
+    while (cursor < static_cast<Int32> (ids.size ()) && scanned < scanLimit && selected.GetSize () < static_cast<USize> (limit)) {
+        API_Elem_Head head = {};
+        head.guid = ids[cursor++];
+        ++scanned;
+        const GSErrCode getError = ACAPI_Element_GetHeader (&head);
+        if (getError != NoError) {
+            GS::ObjectState failure = CreateElementIdObjectState (head.guid);
+            failure.Add ("error", *CreateErrorResponse (getError, "Cannot read candidate header.").Get ("error"));
+            addError (failure);
+            continue;
+        }
+        if ((filterFloor && head.floorInd != floor) || (filterLayer && GetAttributeIndex (head.layer) != layer)) continue;
+        if (filterRenovation && head.renovationStatus != desiredRenovation) continue;
+        if (!nativeFieldFilters.IsEmpty ()) {
+            API_Element full = {};
+            full.header.guid = head.guid;
+            const GSErrCode fullError = ACAPI_Element_Get (&full);
+            if (fullError != NoError) {
+                GS::ObjectState failure = CreateElementIdObjectState (head.guid);
+                failure.Add ("error", *CreateErrorResponse (fullError, "Cannot evaluate candidate native fields.").Get ("error"));
+                addError (failure); continue;
+            }
+            bool matchesAll = true;
+            for (UIndex index = 0; index < nativeFieldFilters.GetSize (); ++index) {
+                const double actual = nativeFieldReaders[index] (full);
+                if (!std::isfinite (actual)) { matchesAll = false; break; }
+                const auto& filter = nativeFieldFilters[index];
+                GS::UniString operation; filter.Get ("operator", operation);
+                double wanted = 0, tolerance = 0;
+                filter.Get ("value", wanted); filter.Get ("tolerance", tolerance);
+                const bool equal = std::abs (actual - wanted) <= tolerance;
+                const bool matches = operation == "Equals" ? equal : operation == "NotEquals" ? !equal :
+                    operation == "GreaterThan" ? actual > wanted : actual < wanted;
+                if (!matches) { matchesAll = false; break; }
+            }
+            if (!matchesAll) continue;
+        }
+        if (classification != nullptr) {
+            GS::Array<GS::Pair<API_Guid, API_Guid>> assignments;
+            const GSErrCode classificationError = ACAPI_Element_GetClassificationItems (head.guid, assignments);
+            if (classificationError != NoError) {
+                GS::ObjectState failure = CreateElementIdObjectState (head.guid);
+                failure.Add ("error", *CreateErrorResponse (classificationError, "Cannot evaluate candidate classifications.").Get ("error"));
+                addError (failure); continue;
+            }
+            bool matches = false;
+            for (const auto& assignment : assignments) if (assignment.second == classificationGuid) matches = true;
+            if (!matches) continue;
+        }
+        if (!propertyIds.IsEmpty ()) {
+            GS::Array<API_Property> values;
+            const GSErrCode propertyError = ACAPI_Element_GetPropertyValuesByGuid (head.guid, propertyIds, values);
+            if (propertyError != NoError) {
+                GS::ObjectState failure = CreateElementIdObjectState (head.guid);
+                failure.Add ("error", *CreateErrorResponse (propertyError, "Cannot evaluate candidate properties.").Get ("error"));
+                addError (failure); continue;
+            }
+            bool matchesAll = true;
+            for (UIndex index = 0; index < propertyFilters.GetSize (); ++index) {
+                const API_Property* actual = nullptr;
+                for (const auto& value : values) if (value.definition.guid == propertyIds[index]) { actual = &value; break; }
+                if (actual == nullptr || actual->status == API_Property_NotEvaluated) {
+                    GS::ObjectState failure = CreateElementIdObjectState (head.guid);
+                    failure.Add ("error", *CreateErrorResponse (APIERR_BADPROPERTY, "A requested candidate property was not returned or evaluated.").Get ("error"));
+                    addError (failure); matchesAll = false; break;
+                }
+                if (actual->status == API_Property_NotAvailable ||
+                    actual->value.variantStatus != API_VariantStatusNormal) { matchesAll = false; break; }
+                const auto& filter = propertyFilters[index];
+                GS::UniString operation; filter.Get ("operator", operation);
+                const auto& value = actual->value.singleVariant.variant;
+                bool equal = false, greater = false, less = false;
+                if (actual->definition.valueType == API_PropertyStringValueType) {
+                    GS::UniString wanted; filter.Get ("value", wanted); equal = value.uniStringValue == wanted;
+                } else if (actual->definition.valueType == API_PropertyBooleanValueType) {
+                    bool wanted = false; filter.Get ("value", wanted); equal = value.boolValue == wanted;
+                } else {
+                    double wanted = 0, tolerance = 0;
+                    if (actual->definition.valueType == API_PropertyIntegerValueType) { Int32 integer = 0; filter.Get ("value", integer); wanted = integer; }
+                    else filter.Get ("value", wanted);
+                    filter.Get ("tolerance", tolerance);
+                    const double number = actual->definition.valueType == API_PropertyIntegerValueType ? static_cast<double> (value.intValue) : value.doubleValue;
+                    if (!std::isfinite (number)) { matchesAll = false; break; }
+                    equal = std::abs (number-wanted) <= tolerance; greater = number > wanted; less = number < wanted;
+                }
+                const bool matches = operation == "Equals" ? equal : operation == "NotEquals" ? !equal : operation == "GreaterThan" ? greater : less;
+                if (!matches) { matchesAll = false; break; }
+            }
+            if (!matchesAll) continue;
+        }
+        API_Box3D box = {};
+        if (bounds != nullptr || includeBounds) {
+            const GSErrCode boundsError = ACAPI_Element_CalcBounds (&head, &box);
+            if (boundsError != NoError) {
+                GS::ObjectState failure = CreateElementIdObjectState (head.guid);
+                failure.Add ("error", *CreateErrorResponse (boundsError, "Cannot evaluate native bounds for this candidate.").Get ("error"));
+                addError (failure); continue;
+            }
+            if (bounds != nullptr && (box.xMax < xMin || box.xMin > xMax || box.yMax < yMin || box.yMin > yMax ||
+                (boundsAre3D && (box.zMax < zMin || box.zMin > zMax)))) continue;
+        }
+        GS::ObjectState entry = CreateElementIdObjectState (head.guid);
+        selected.Push (entry);
+        entry.Add ("type", GetElementTypeNonLocalizedName (GetElemTypeId (head)));
+        entry.Add ("floorIndex", head.floorInd);
+        entry.Add ("layerIndex", GetAttributeIndex (head.layer));
+        entry.Add ("modificationStamp", GS::UniString (std::to_string (head.modiStamp).c_str ()));
+        if (includeBounds) entry.Add ("bounds3D", GS::ObjectState ("xMin", box.xMin, "yMin", box.yMin, "zMin", box.zMin, "xMax", box.xMax, "yMax", box.yMax, "zMax", box.zMax));
+        add (entry);
+    }
+    if (includeDetails && !selected.IsEmpty ())
+        response.Add ("details", GetDetailsOfElementsCommand ().Execute (GS::ObjectState ("elements", selected), processControl));
+    response.Add ("candidateCount", static_cast<Int32> (ids.size ()));
+    response.Add ("scannedCount", scanned);
+    response.Add ("nextOffset", cursor);
+    response.Add ("hasMore", cursor < static_cast<Int32> (ids.size ()));
+    return response;
+}
+
+GS::Optional<GS::UniString> FindDuplicateElementsCommand::GetInputParametersSchema () const
+{
+    return R"({"type":"object","properties":{
+        "elementType":{"$ref":"#/ElementType"},
+        "floorIndex":{"type":"integer"},"layerIndex":{"type":"integer"},
+        "positionTolerance":{"type":"number","exclusiveMinimum":0,"description":"Metres. Maximum bounding-box center distance to treat elements as stacked/duplicated. Default 0.01 (1cm)."},
+        "sizeTolerance":{"type":"number","exclusiveMinimum":0,"description":"Metres. Maximum per-axis bounding-box extent difference to treat elements as the same size. Default 0.01 (1cm)."},
+        "offset":{"type":"integer","minimum":0},
+        "scanLimit":{"type":"integer","minimum":1,"maximum":1000,"description":"How many candidates of this type to examine in this call, in stable sorted order. Default 500. Groups only ever contain elements examined within the same call; rerun with a later offset to cover more."}
+    },"required":["elementType"],"additionalProperties":false})";
+}
+
+GS::Optional<GS::UniString> FindDuplicateElementsCommand::GetRawResponseSchema () const
+{
+    return R"({"type":"object","properties":{
+        "duplicateGroups":{"type":"array","items":{"type":"object","properties":{
+            "elements":{"$ref":"#/Elements"},
+            "center":{"$ref":"#/Coordinate3D"},
+            "size":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"},"z":{"type":"number"}},"required":["x","y","z"],"additionalProperties":false}
+        },"required":["elements","center","size"],"additionalProperties":false}},
+        "errors":{"type":"array","items":{"type":"object"}},
+        "candidateCount":{"type":"integer"},"scannedCount":{"type":"integer"},
+        "nextOffset":{"type":"integer"},"hasMore":{"type":"boolean"},"boundsUnits":{"const":"metres"}
+    },"required":["duplicateGroups","errors","candidateCount","scannedCount","nextOffset","hasMore"],"additionalProperties":false})";
+}
+
+GS::ObjectState FindDuplicateElementsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const
+{
+    GS::UniString typeName;
+    parameters.Get ("elementType", typeName);
+    const API_ElemTypeID type = GetElementTypeFromNonLocalizedName (typeName);
+    if (type == API_ZombieElemID)
+        return CreateErrorResponse (APIERR_BADPARS, "A valid elementType is required.");
+
+    Int32 offset = 0, scanLimit = 500, floor = 0, layer = 0;
+    parameters.Get ("offset", offset);
+    parameters.Get ("scanLimit", scanLimit);
+    const bool filterFloor = parameters.Get ("floorIndex", floor);
+    const bool filterLayer = parameters.Get ("layerIndex", layer);
+    double positionTolerance = 0.01, sizeTolerance = 0.01;
+    parameters.Get ("positionTolerance", positionTolerance);
+    parameters.Get ("sizeTolerance", sizeTolerance);
+    if (offset < 0 || scanLimit < 1 || scanLimit > 1000 || !std::isfinite (positionTolerance) || positionTolerance <= 0 ||
+        !std::isfinite (sizeTolerance) || sizeTolerance <= 0)
+        return CreateErrorResponse (APIERR_BADPARS, "Invalid pagination limits or tolerance.");
+
+    GS::Array<API_Guid> nativeIds;
+    const GSErrCode enumError = ACAPI_Element_GetElemList (type, &nativeIds);
+    if (enumError != NoError) return CreateErrorResponse (enumError, "Cannot enumerate the current database.");
+    std::vector<API_Guid> ids;
+    for (const auto& guid : nativeIds) ids.push_back (guid);
+    std::sort (ids.begin (), ids.end (), [](const API_Guid& a, const API_Guid& b) {
+        return APIGuidToString (a) < APIGuidToString (b);
+    });
+
+    GS::ObjectState response;
+    response.Add ("boundsUnits", "metres");
+    const auto& addError = response.AddList<GS::ObjectState> ("errors");
+
+    struct Group { std::vector<API_Guid> members; API_Box3D bounds; };
+    std::vector<Group> groups;
+
+    Int32 cursor = offset, scanned = 0;
+    while (cursor < static_cast<Int32> (ids.size ()) && scanned < scanLimit) {
+        const API_Guid candidateGuid = ids[cursor++];
+        ++scanned;
+        API_Elem_Head head = {};
+        head.guid = candidateGuid;
+        const GSErrCode headerError = ACAPI_Element_GetHeader (&head);
+        if (headerError != NoError) {
+            GS::ObjectState failure = CreateElementIdObjectState (candidateGuid);
+            failure.Add ("error", *CreateErrorResponse (headerError, "Cannot read candidate header.").Get ("error"));
+            addError (failure); continue;
+        }
+        if ((filterFloor && head.floorInd != floor) || (filterLayer && GetAttributeIndex (head.layer) != layer)) continue;
+
+        API_Box3D box = {};
+        const GSErrCode boundsError = ACAPI_Element_CalcBounds (&head, &box);
+        if (boundsError != NoError) {
+            GS::ObjectState failure = CreateElementIdObjectState (candidateGuid);
+            failure.Add ("error", *CreateErrorResponse (boundsError, "Cannot evaluate native bounds for this candidate.").Get ("error"));
+            addError (failure); continue;
+        }
+
+        const double centerX = (box.xMin + box.xMax) / 2, centerY = (box.yMin + box.yMax) / 2, centerZ = (box.zMin + box.zMax) / 2;
+        const double sizeX = box.xMax - box.xMin, sizeY = box.yMax - box.yMin, sizeZ = box.zMax - box.zMin;
+
+        bool placed = false;
+        for (auto& group : groups) {
+            const double gCenterX = (group.bounds.xMin + group.bounds.xMax) / 2, gCenterY = (group.bounds.yMin + group.bounds.yMax) / 2, gCenterZ = (group.bounds.zMin + group.bounds.zMax) / 2;
+            const double gSizeX = group.bounds.xMax - group.bounds.xMin, gSizeY = group.bounds.yMax - group.bounds.yMin, gSizeZ = group.bounds.zMax - group.bounds.zMin;
+            if (std::abs (centerX - gCenterX) <= positionTolerance && std::abs (centerY - gCenterY) <= positionTolerance && std::abs (centerZ - gCenterZ) <= positionTolerance &&
+                std::abs (sizeX - gSizeX) <= sizeTolerance && std::abs (sizeY - gSizeY) <= sizeTolerance && std::abs (sizeZ - gSizeZ) <= sizeTolerance) {
+                group.members.push_back (candidateGuid);
+                placed = true;
+                break;
+            }
+        }
+        if (!placed) groups.push_back ({{candidateGuid}, box});
+    }
+
+    const auto& addGroup = response.AddList<GS::ObjectState> ("duplicateGroups");
+    for (const auto& group : groups) {
+        if (group.members.size () < 2) continue;
+        GS::ObjectState groupEntry;
+        const auto& members = groupEntry.AddList<GS::ObjectState> ("elements");
+        for (const auto& guid : group.members) members (CreateElementIdObjectState (guid));
+        groupEntry.Add ("center", Create3DCoordinateObjectState (API_Coord3D { (group.bounds.xMin + group.bounds.xMax) / 2, (group.bounds.yMin + group.bounds.yMax) / 2, (group.bounds.zMin + group.bounds.zMax) / 2 }));
+        groupEntry.Add ("size", GS::ObjectState ("x", group.bounds.xMax - group.bounds.xMin, "y", group.bounds.yMax - group.bounds.yMin, "z", group.bounds.zMax - group.bounds.zMin));
+        addGroup (groupEntry);
+    }
+    response.Add ("candidateCount", static_cast<Int32> (ids.size ()));
+    response.Add ("scannedCount", scanned);
+    response.Add ("nextOffset", cursor);
+    response.Add ("hasMore", cursor < static_cast<Int32> (ids.size ()));
+    return response;
+}
+
+GS::Optional<GS::UniString> ExplainElementCommand::GetInputParametersSchema () const
+{
+    return R"({"type":"object","properties":{
+        "elements":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","properties":{"elementId":{"$ref":"#/ElementId"}},"required":["elementId"],"additionalProperties":false}},
+        "minimumWallOpeningArea":{"type":"number","minimum":0,"description":"Square metres, passed through to the native quantities. Default 0."},
+        "classificationSystemIds":{"$ref":"#/ClassificationSystemIds","description":"Optional. If given, includes each element's classification in these systems. Omitted entirely from the result if not given - this command does not enumerate all classification systems in the project itself."},
+        "propertyIds":{"$ref":"#/PropertyIds","description":"Optional. If given, includes each element's values for these specific properties. Omitted entirely from the result if not given - there is no 'every property' mode, since most are irrelevant to most elements."}
+    },"required":["elements"],"additionalProperties":false})";
+}
+
+GS::Optional<GS::UniString> ExplainElementCommand::GetRawResponseSchema () const
+{
+    return R"({"type":"object","properties":{
+        "elements":{"type":"array","items":{"type":"object","properties":{
+            "elementId":{"$ref":"#/ElementId"},
+            "details":{"type":"object","description":"See GetDetailsOfElements."},
+            "quantities":{"type":"object","description":"See GetNativeQuantities."},
+            "relations":{"type":"object","description":"See GetRelationsOfElements."},
+            "classifications":{"type":"object","description":"See GetClassificationsOfElements. Present only if classificationSystemIds was given."},
+            "properties":{"type":"array","description":"See GetPropertyValuesOfElements. Present only if propertyIds was given."}
+        },"required":["elementId","details","quantities","relations"],"additionalProperties":false}}
+    },"required":["elements"],"additionalProperties":false})";
+}
+
+GS::ObjectState ExplainElementCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const
+{
+    GS::Array<GS::ObjectState> elements;
+    parameters.Get ("elements", elements);
+    if (elements.IsEmpty () || elements.GetSize () > 20) return CreateErrorResponse (APIERR_BADPARS, "Supply 1 to 20 elements.");
+
+    const GS::ObjectState elementsInput ("elements", elements);
+
+    const GS::ObjectState detailsResponse = GetDetailsOfElementsCommand ().Execute (elementsInput, processControl);
+    GS::Array<GS::ObjectState> detailsOfElements;
+    detailsResponse.Get ("detailsOfElements", detailsOfElements);
+
+    GS::ObjectState quantitiesInput = elementsInput;
+    double minimumWallOpeningArea = 0;
+    if (parameters.Get ("minimumWallOpeningArea", minimumWallOpeningArea)) quantitiesInput.Add ("minimumWallOpeningArea", minimumWallOpeningArea);
+    const GS::ObjectState quantitiesResponse = GetNativeQuantitiesCommand ().Execute (quantitiesInput, processControl);
+    GS::Array<GS::ObjectState> quantities;
+    quantitiesResponse.Get ("quantities", quantities);
+
+    const GS::ObjectState relationsResponse = GetRelationsOfElementsCommand ().Execute (elementsInput, processControl);
+    GS::Array<GS::ObjectState> relations;
+    relationsResponse.Get ("relations", relations);
+
+    const GS::ObjectState* classificationSystemIds = parameters.Get ("classificationSystemIds");
+    GS::Array<GS::ObjectState> elementClassifications;
+    if (classificationSystemIds != nullptr) {
+        GS::ObjectState classificationsInput = elementsInput;
+        classificationsInput.Add ("classificationSystemIds", *classificationSystemIds);
+        const GS::ObjectState classificationsResponse = GetClassificationsOfElementsCommand ().Execute (classificationsInput, processControl);
+        classificationsResponse.Get ("elementClassifications", elementClassifications);
+    }
+
+    const GS::ObjectState* propertyIds = parameters.Get ("propertyIds");
+    GS::Array<GS::ObjectState> propertyValuesForElements;
+    if (propertyIds != nullptr) {
+        GS::ObjectState propertiesInput = elementsInput;
+        propertiesInput.Add ("properties", *propertyIds);
+        const GS::ObjectState propertiesResponse = GetPropertyValuesOfElementsCommand ().Execute (propertiesInput, processControl);
+        propertiesResponse.Get ("propertyValuesForElements", propertyValuesForElements);
+    }
+
+    GS::ObjectState response;
+    const auto& add = response.AddList<GS::ObjectState> ("elements");
+    for (UIndex i = 0; i < elements.GetSize (); ++i) {
+        GS::ObjectState entry = CreateElementIdObjectState (GetGuidFromArrayItem ("elementId", elements[i]));
+        if (i < detailsOfElements.GetSize ()) entry.Add ("details", detailsOfElements[i]);
+        if (i < quantities.GetSize ()) entry.Add ("quantities", quantities[i]);
+        if (i < relations.GetSize ()) entry.Add ("relations", relations[i]);
+        if (classificationSystemIds != nullptr && i < elementClassifications.GetSize ()) entry.Add ("classifications", elementClassifications[i]);
+        if (propertyIds != nullptr && i < propertyValuesForElements.GetSize ()) entry.Add ("properties", propertyValuesForElements[i]);
+        add (entry);
+    }
+    return response;
+}
+
+GS::Optional<GS::UniString> TransformElementsCommand::GetInputParametersSchema () const
+{
+    return R"({"type":"object","properties":{
+        "elements":{"type":"array","minItems":1,"maxItems":1000,"uniqueItems":true,
+            "items":{"type":"object","properties":{"elementId":{"$ref":"#/ElementId"}},"required":["elementId"],"additionalProperties":false}},
+        "operation":{"type":"string","enum":["Move","Rotate","Mirror","Resize"]},
+        "copy":{"type":"boolean"},
+        "repeatCount":{"type":"integer","minimum":1,"maximum":100,"description":"Number of copies, default 1. Requires copy:true. Move uses multiples of vector; Rotate uses multiples of angle; Resize uses powers of factor. Total targets times count must not exceed 1000."},
+        "requireAllGroupMembers":{"type":"boolean","default":false,"description":"Allow grouped targets only if every member of each root group is explicitly included. Does not change Suspend Groups mode."},
+        "vector":{"$ref":"#/Coordinate3D"},"origin":{"$ref":"#/Coordinate2D"},
+        "axisStart":{"$ref":"#/Coordinate2D"},"axisEnd":{"$ref":"#/Coordinate2D"},
+        "angle":{"type":"number","description":"Counterclockwise radians in project XY."},
+        "factor":{"type":"number","exclusiveMinimum":0,"description":"Positive native planar resize factor."}
+    },"required":["elements","operation"],"additionalProperties":false,
+    "allOf":[{"if":{"required":["repeatCount"]},"then":{"properties":{"copy":{"const":true}},"required":["copy"]}},{"if":{"properties":{"operation":{"const":"Mirror"}},"required":["operation"]},"then":{"properties":{"repeatCount":{"const":1}}}}],
+    "oneOf":[
+        {"properties":{"operation":{"const":"Move"}},"required":["vector"],"not":{"anyOf":[{"required":["origin"]},{"required":["angle"]},{"required":["axisStart"]},{"required":["axisEnd"]},{"required":["factor"]}]}},
+        {"properties":{"operation":{"const":"Rotate"}},"required":["origin","angle"],"not":{"anyOf":[{"required":["vector"]},{"required":["axisStart"]},{"required":["axisEnd"]},{"required":["factor"]}]}},
+        {"properties":{"operation":{"const":"Mirror"}},"required":["axisStart","axisEnd"],"not":{"anyOf":[{"required":["vector"]},{"required":["origin"]},{"required":["angle"]},{"required":["factor"]}]}},
+        {"properties":{"operation":{"const":"Resize"}},"required":["origin","factor"],"not":{"anyOf":[{"required":["vector"]},{"required":["axisStart"]},{"required":["axisEnd"]},{"required":["angle"]}]}}
+    ]})";
+}
+
+GS::Optional<GS::UniString> TransformElementsCommand::GetRawResponseSchema () const
+{
+    return R"({"type":"object","properties":{
+        "success":{"type":"boolean"},"status":{"type":"string"},"verification":{"type":"string"},
+        "nativeReturnedElements":{"$ref":"#/Elements"},"copy":{"type":"boolean"},
+        "dependentLinksMayChange":{"type":"boolean"},
+        "resultMappingAvailable":{"type":"boolean"},
+        "results":{"type":"array","items":{"type":"object","properties":{
+            "repetition":{"type":"integer"},"sourceElementId":{"$ref":"#/ElementId"},"resultElementId":{"$ref":"#/ElementId"},
+            "status":{"type":"string"},"error":{"type":"object"}
+        },"required":["sourceElementId","status"],"additionalProperties":false}}
+    },"required":["success","status","verification","nativeReturnedElements","copy","dependentLinksMayChange","resultMappingAvailable","results"],"additionalProperties":false})";
+}
+
+GS::ObjectState TransformElementsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const
+{
+    GS::Array<GS::ObjectState> requested;
+    parameters.Get ("elements", requested);
+    if (requested.IsEmpty () || requested.GetSize () > 1000)
+        return CreateErrorResponse (APIERR_BADPARS, "Supply between 1 and 1000 explicit elements; current selection is never used.");
+    GS::Array<API_Neig> native;
+    GS::HashSet<API_Guid> unique;
+    GS::HashSet<API_Guid> rootGroups;
+    bool requireAllGroupMembers = false;
+    parameters.Get ("requireAllGroupMembers", requireAllGroupMembers);
+    for (const auto& entry : requested) {
+        const API_Guid guid = GetGuidFromArrayItem ("elementId", entry);
+        if (guid == APINULLGuid || unique.Contains (guid))
+            return CreateErrorResponse (APIERR_BADPARS, "Element IDs must be valid and unique.");
+        API_Elem_Head head = {};
+        head.guid = guid;
+        const GSErrCode err = ACAPI_Element_GetHeader (&head);
+        if (err != NoError) return CreateErrorResponse (err, "Cannot read a requested element.");
+        if (!ACAPI_Element_Filter (guid, APIFilt_IsEditable | APIFilt_InMyWorkspace | APIFilt_HasAccessRight))
+            return CreateErrorResponse (APIERR_BADPARS, "A requested element is not editable in the current project context.");
+        API_Guid group = APINULLGuid;
+        if (ACAPI_Grouping_GetGroup (guid, &group) == NoError && group != APINULLGuid) {
+            if (!requireAllGroupMembers)
+                return CreateErrorResponse (APIERR_BADPARS, "Grouped elements require requireAllGroupMembers and an explicit complete member list.");
+            API_Guid root = APINULLGuid;
+            const GSErrCode groupError = ACAPI_Grouping_GetRootGroup (group, &root);
+            if (groupError != NoError || root == APINULLGuid)
+                return CreateErrorResponse (groupError != NoError ? groupError : APIERR_BADID, "Cannot resolve root group.");
+            rootGroups.Add (root);
+        }
+        unique.Add (guid);
+        native.Push (API_Neig (guid));
+    }
+    for (const auto& group : rootGroups) {
+        GS::Array<API_Guid> members;
+        const GSErrCode err = ACAPI_Grouping_GetAllGroupedElems (group, &members);
+        if (err != NoError) return CreateErrorResponse (err, "Cannot enumerate the complete root group.");
+        for (const auto& member : members) {
+            API_Elem_Head memberHead = {}; memberHead.guid = member;
+            const GSErrCode readError = ACAPI_Element_GetHeader (&memberHead);
+            if (readError != NoError) return CreateErrorResponse (readError, "Cannot inspect a root-group member.");
+            if (GetElemTypeId (memberHead) != API_GroupID && !unique.Contains (member))
+                return CreateErrorResponse (APIERR_BADPARS, "Request omits a root-group member; no transformation was attempted.");
+        }
+    }
+    const GS::Array<API_Neig> sources = native;
+    API_EditPars edit = {};
+    bool copy = false;
+    parameters.Get ("copy", copy);
+    edit.withDelete = !copy;
+    Int32 repeatCount = 1;
+    parameters.Get ("repeatCount", repeatCount);
+    if (repeatCount < 1 || repeatCount > 100 || sources.GetSize () * repeatCount > 1000 ||
+        (parameters.Contains ("repeatCount") && !copy))
+        return CreateErrorResponse (APIERR_BADPARS, "Repeat requires copy:true, a count from 1 to 100 and at most 1000 total results.");
+    GS::UniString operation;
+    parameters.Get ("operation", operation);
+    if (operation == "Move") {
+        const auto* vector = parameters.Get ("vector");
+        if (vector == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Move requires vector.");
+        edit.typeID = APIEdit_Drag;
+        edit.endC = Get3DCoordinateFromObjectState (*vector);
+    } else if (operation == "Mirror") {
+        const auto* first = parameters.Get ("axisStart");
+        const auto* last = parameters.Get ("axisEnd");
+        if (first == nullptr || last == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Mirror requires axisStart and axisEnd.");
+        const auto a = Get2DCoordinateFromObjectState (*first), b = Get2DCoordinateFromObjectState (*last);
+        if (std::hypot (b.x - a.x, b.y - a.y) < 1e-9)
+            return CreateErrorResponse (APIERR_BADPARS, "Mirror axis has zero length.");
+        edit.typeID = APIEdit_Mirror;
+        edit.begC = {a.x, a.y, 0};
+        edit.endC = {b.x, b.y, 0};
+    } else if (operation == "Rotate" || operation == "Resize") {
+        const auto* origin = parameters.Get ("origin");
+        if (origin == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Rotate and Resize require origin.");
+        edit.origC = Get2DCoordinateFromObjectState (*origin);
+        if (operation == "Rotate") {
+            double angle;
+            if (!parameters.Get ("angle", angle) || !std::isfinite (angle)) return CreateErrorResponse (APIERR_BADPARS, "Rotate requires a finite angle in radians.");
+            edit.typeID = APIEdit_Rotate;
+            edit.begC = {edit.origC.x + 1, edit.origC.y, 0};
+            edit.endC = {edit.origC.x + std::cos (angle), edit.origC.y + std::sin (angle), 0};
+        } else {
+            double factor;
+            if (!parameters.Get ("factor", factor) || !std::isfinite (factor) || factor <= 0) return CreateErrorResponse (APIERR_BADPARS, "Resize requires a finite positive factor.");
+            edit.typeID = APIEdit_Resize;
+            edit.begC = {edit.origC.x, edit.origC.y, 0};
+            edit.endC = {edit.origC.x + 1, edit.origC.y, 0};
+            edit.endC2 = {edit.origC.x + factor, edit.origC.y, 0};
+        }
+    } else return CreateErrorResponse (APIERR_BADPARS, "Unsupported transform operation.");
+    const double coordinates[] = {edit.origC.x, edit.origC.y, edit.begC.x, edit.begC.y, edit.begC.z,
+        edit.endC.x, edit.endC.y, edit.endC.z, edit.endC2.x, edit.endC2.y, edit.endC2.z};
+    for (const double coordinate : coordinates)
+        if (!std::isfinite (coordinate)) return CreateErrorResponse (APIERR_BADPARS, "All transformation coordinates must be finite.");
+    if (operation == "Mirror" && repeatCount != 1)
+        return CreateErrorResponse (APIERR_BADPARS, "Repeated copies support Move, Rotate and Resize; Mirror has one result per source.");
+    std::vector<API_EditPars> repetitions;
+    for (Int32 repetition=1; repetition<=repeatCount; ++repetition) {
+        API_EditPars repeated = edit;
+        if (operation == "Move") {
+            repeated.endC.x *= repetition; repeated.endC.y *= repetition; repeated.endC.z *= repetition;
+        } else if (operation == "Rotate") {
+            double angle = 0; parameters.Get ("angle", angle); angle *= repetition;
+            repeated.endC = {edit.origC.x + std::cos (angle), edit.origC.y + std::sin (angle), 0};
+        } else if (operation == "Resize") {
+            double factor = 1; parameters.Get ("factor", factor);
+            const double repeatedFactor = std::pow (factor, repetition);
+            if (!std::isfinite (repeatedFactor) || repeatedFactor <= 0)
+                return CreateErrorResponse (APIERR_BADPARS, "Repeated resize factor is outside finite positive range.");
+            repeated.endC2.x = edit.origC.x + repeatedFactor;
+        }
+        if (!std::isfinite (repeated.endC.x) || !std::isfinite (repeated.endC.y) || !std::isfinite (repeated.endC.z) || !std::isfinite (repeated.endC2.x))
+            return CreateErrorResponse (APIERR_BADPARS, "Repeated transformation exceeds finite coordinate range.");
+        repetitions.push_back (repeated);
+    }
+    bool mappingAvailable = true;
+    GS::Array<API_Neig> allResults;
+    const GSErrCode transaction = ACAPI_CallUndoableCommand ("Transform Elements", [&] () -> GSErrCode {
+        for (const auto& repeated : repetitions) {
+            native = sources;
+            const GSErrCode err = ACAPI_Element_Edit (&native, repeated);
+            if (err != NoError) return err;
+            mappingAvailable &= native.GetSize () == sources.GetSize ();
+            for (const auto& result : native) allResults.Push (result);
+        }
+        return NoError;
+    });
+    if (transaction != NoError) return CreateErrorResponse (transaction, "Native transformation transaction failed; committed changes are not confirmed.");
+    native = allResults;
+    bool allAccepted = mappingAvailable;
+    GS::ObjectState response ("verification", "nativeResultIdsReadBack", "copy", copy,
+        "dependentLinksMayChange", true, "resultMappingAvailable", mappingAvailable);
+    const auto& add = response.AddList<GS::ObjectState> ("nativeReturnedElements");
+    for (const auto& item : native) if (item.guid != APINULLGuid) add (CreateElementIdObjectState (item.guid));
+    const auto& addResult = response.AddList<GS::ObjectState> ("results");
+    if (mappingAvailable) {
+        for (UIndex index=0; index<native.GetSize (); ++index) {
+            const API_Guid sourceGuid = sources[index % sources.GetSize ()].guid;
+            GS::ObjectState result ("sourceElementId", CreateGuidObjectState (sourceGuid), "repetition", static_cast<Int32> (index / sources.GetSize () + 1));
+            API_Elem_Head head = {}; head.guid = native[index].guid;
+            GSErrCode resultError = head.guid == APINULLGuid ? APIERR_REFUSEDPAR : ACAPI_Element_GetHeader (&head);
+            if (resultError == NoError && copy && head.guid == sourceGuid) resultError = APIERR_REFUSEDPAR;
+            if (head.guid != APINULLGuid) result.Add ("resultElementId", CreateGuidObjectState (head.guid));
+            if (resultError == NoError) result.Add ("status", "executionAccepted");
+            else {
+                allAccepted = false;
+                result.Add ("status", "notConfirmed");
+                result.Add ("error", *CreateErrorResponse (resultError, "Native transformation did not return a readable result identity; for copying it must differ from the source.").Get ("error"));
+            }
+            addResult (result);
+        }
+    }
+    response.Add ("success", allAccepted);
+    response.Add ("status", !mappingAvailable ? "outcomeUnknown" : allAccepted ? "executionAccepted" : "partialOrRefused");
+    return response;
+}

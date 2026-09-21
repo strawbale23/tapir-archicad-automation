@@ -1,6 +1,9 @@
 #include "DocumentCreationCommands.hpp"
 
 #include "MigrationHelper.hpp"
+#include <cstring>
+#include <cmath>
+#include "GSProcessControl.hpp"
 
 namespace {
 
@@ -43,11 +46,11 @@ bool GetItems (const GS::ObjectState& parameters, const char* fieldName, GS::Arr
     return true;
 }
 
-GS::Array<API_Guid> GetLayoutDatabaseGuids ()
+GSErrCode GetLayoutDatabaseGuids (GS::Array<API_Guid>& guids)
 {
-    GS::Array<API_Guid> guids;
     GS::Array<API_DatabaseUnId> dbases;
-    if (ACAPI_Database_GetLayoutDatabases (nullptr, &dbases) == NoError) {
+    const GSErrCode err = ACAPI_Database_GetLayoutDatabases (nullptr, &dbases);
+    if (err == NoError) {
         for (const auto& db : dbases) {
             API_DatabaseInfo info = {};
             info.typeID = APIWind_LayoutID;
@@ -55,32 +58,39 @@ GS::Array<API_Guid> GetLayoutDatabaseGuids ()
             guids.Push (DatabaseIdResolver::Instance ().GetIdOfDatabase (info));
         }
     }
-    return guids;
+    return err;
 }
 
-GS::Optional<API_Guid> FindNewLayoutDatabaseGuid (const GS::Array<API_Guid>& before)
+GS::Optional<API_Guid> FindNewLayoutDatabaseGuid (const GS::Array<API_Guid>& before, GSErrCode& error)
 {
-    const GS::Array<API_Guid> after = GetLayoutDatabaseGuids ();
+    GS::Array<API_Guid> after;
+    error = GetLayoutDatabaseGuids (after);
+    if (error != NoError) return {};
+    GS::Optional<API_Guid> found;
     for (const auto& guid : after) {
         if (!before.Contains (guid)) {
-            return guid;
+            if (found.HasValue ()) { error = APIERR_GENERAL; return {}; }
+            found = guid;
         }
     }
-    return {};
+    return found;
 }
 
-GS::Optional<API_DatabaseInfo> FindMasterLayoutDatabaseByName (const GS::UniString& masterLayoutName)
+GS::Optional<API_DatabaseInfo> FindMasterLayoutDatabaseByName (const GS::UniString& masterLayoutName, GSErrCode& error)
 {
     GS::Optional<API_DatabaseInfo> foundMasterLayout;
     GS::Array<API_DatabaseUnId> dbases;
-    if (ACAPI_Database_GetMasterLayoutDatabases (nullptr, &dbases) == NoError) {
+    error = ACAPI_Database_GetMasterLayoutDatabases (nullptr, &dbases);
+    if (error == NoError) {
         for (const auto& db : dbases) {
             API_DatabaseInfo candidate = {};
             candidate.typeID = APIWind_MasterLayoutID;
             candidate.databaseUnId = db;
-            if (ACAPI_Window_GetDatabaseInfo (&candidate) == NoError && GS::UniString (candidate.name) == masterLayoutName) {
+            error = ACAPI_Window_GetDatabaseInfo (&candidate);
+            if (error != NoError) return {};
+            if (GS::UniString (candidate.name) == masterLayoutName) {
+                if (foundMasterLayout.HasValue ()) { error = APIERR_BADPARS; return {}; }
                 foundMasterLayout = candidate;
-                break;
             }
         }
     }
@@ -88,30 +98,30 @@ GS::Optional<API_DatabaseInfo> FindMasterLayoutDatabaseByName (const GS::UniStri
     return foundMasterLayout;
 }
 
-GS::Optional<API_Guid> FindLayoutDatabaseGuidByName (const GS::UniString& layoutName)
+GSErrCode FindLayoutSibling (API_Guid parentGuid, const GS::UniString& layoutName, GS::Optional<API_DatabaseInfo>& found)
 {
-    GS::Optional<API_Guid> foundLayoutGuid;
-
-    GS::Array<API_DatabaseUnId> dbases;
-    if (ACAPI_Database_GetLayoutDatabases (nullptr, &dbases) == NoError) {
-        for (const auto& db : dbases) {
-            API_DatabaseInfo candidate = {};
-            candidate.typeID = APIWind_LayoutID;
-            candidate.databaseUnId = db;
-            if (ACAPI_Window_GetDatabaseInfo (&candidate) == NoError && GS::UniString (candidate.name) == layoutName) {
-                foundLayoutGuid = DatabaseIdResolver::Instance ().GetIdOfDatabase (candidate);
-                break;
-            }
-        }
+    API_NavigatorItem parent = {};
+    GSErrCode err = ACAPI_Navigator_GetNavigatorItem (&parentGuid, &parent);
+    if (err != NoError) return err;
+    if (parent.mapId != API_LayoutMap || (parent.itemType != API_BookNavItem && parent.itemType != API_SubSetNavItem)) return APIERR_BADPARS;
+    GS::Array<API_NavigatorItem> children;
+    err = ACAPI_Navigator_GetNavigatorChildrenItems (&parent, &children);
+    if (err != NoError) return err;
+    for (const auto& child : children) {
+        if (GS::UniString (child.uName) != layoutName) continue;
+        if (found.HasValue () || child.itemType != API_LayoutNavItem) return APIERR_BADPARS;
+        API_DatabaseInfo database = child.db;
+        err = ACAPI_Window_GetDatabaseInfo (&database);
+        if (err != NoError) return err;
+        found = database;
     }
-
-    return foundLayoutGuid;
+    return NoError;
 }
 
-bool GetLayoutInfoForDatabase (const API_DatabaseUnId& databaseUnId, API_LayoutInfo& layoutInfo)
+GSErrCode GetLayoutInfoForDatabase (const API_DatabaseUnId& databaseUnId, API_LayoutInfo& layoutInfo)
 {
     BNZeroMemory (&layoutInfo, sizeof (layoutInfo));
-    return ACAPI_Navigator_GetLayoutSets (&layoutInfo, const_cast<API_DatabaseUnId*> (&databaseUnId)) == NoError;
+    return ACAPI_Navigator_GetLayoutSets (&layoutInfo, const_cast<API_DatabaseUnId*> (&databaseUnId));
 }
 
 }
@@ -244,6 +254,96 @@ GS::ObjectState CreateWorksheetsCommand::Execute (const GS::ObjectState& paramet
     return CreateDatabasesResponse (databases);
 }
 
+GS::Optional<GS::UniString> CreateMasterLayoutsCommand::GetInputParametersSchema () const
+{
+    return R"({"type":"object","properties":{"masters":{"type":"array","minItems":1,"maxItems":100,"items":{
+        "type":"object","properties":{
+            "name":{"type":"string","minLength":1,"maxLength":255},
+            "widthMillimetres":{"type":"number","exclusiveMinimum":0},"heightMillimetres":{"type":"number","exclusiveMinimum":0},
+            "leftMarginMillimetres":{"type":"number","minimum":0},"rightMarginMillimetres":{"type":"number","minimum":0},
+            "topMarginMillimetres":{"type":"number","minimum":0},"bottomMarginMillimetres":{"type":"number","minimum":0},
+            "ifExists":{"type":"string","enum":["Error","ReuseIfMatching"],"description":"Default Error. Reuse requires an exact name and matching paper size/margins, tolerance 0.000001 mm. Omitted margins mean zero. Existing masters are never modified."}
+        },"required":["name","widthMillimetres","heightMillimetres"],"additionalProperties":false
+    }}},"required":["masters"],"additionalProperties":false})";
+}
+
+GS::Optional<GS::UniString> CreateMasterLayoutsCommand::GetRawResponseSchema () const
+{
+    return R"({"type":"object","properties":{"results":{"type":"array","items":{
+        "type":"object","properties":{"inputIndex":{"type":"integer"},"status":{"type":"string","enum":["created","reused","failed","incomplete"]},
+            "databaseId":{"$ref":"#/DatabaseId"},"error":{"type":"object"},"verification":{"type":"string"}},
+        "required":["inputIndex","status"],"additionalProperties":false
+    }}},"required":["results"],"additionalProperties":false})";
+}
+
+GS::ObjectState CreateMasterLayoutsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const
+{
+    GS::Array<GS::ObjectState> masters; parameters.Get ("masters", masters);
+    if (masters.IsEmpty () || masters.GetSize () > 100) return CreateErrorResponse (APIERR_BADPARS, "Supply 1 to 100 master layouts.");
+    GS::ObjectState response;
+    const auto& add = response.AddList<GS::ObjectState> ("results");
+    Int32 inputIndex = -1;
+    for (const auto& item : masters) {
+        GS::ObjectState row ("inputIndex", ++inputIndex);
+        const auto fail = [&] (GSErrCode error, const char* message, bool created) {
+            row.Add ("status", created ? "incomplete" : "failed");
+            row.Add ("error", *CreateErrorResponse (error, message).Get ("error")); add (row);
+        };
+        GS::UniString name, policy = "Error";
+        item.Get ("name", name); item.Get ("ifExists", policy);
+        API_LayoutInfo desired = {};
+        item.Get ("widthMillimetres", desired.sizeX); item.Get ("heightMillimetres", desired.sizeY);
+        item.Get ("leftMarginMillimetres", desired.leftMargin); item.Get ("rightMarginMillimetres", desired.rightMargin);
+        item.Get ("topMarginMillimetres", desired.topMargin); item.Get ("bottomMarginMillimetres", desired.bottomMargin);
+        bool finite = true;
+        for (double value : {desired.sizeX, desired.sizeY, desired.leftMargin, desired.rightMargin, desired.topMargin, desired.bottomMargin})
+            finite &= std::isfinite (value) && value >= 0;
+        if (name.IsEmpty () || name.GetLength () >= API_UniLongNameLen || !finite || desired.sizeX <= 0 || desired.sizeY <= 0 ||
+            desired.leftMargin + desired.rightMargin >= desired.sizeX || desired.topMargin + desired.bottomMargin >= desired.sizeY ||
+            (policy != "Error" && policy != "ReuseIfMatching")) {
+            fail (APIERR_BADPARS, "Supply a valid name and finite positive paper size with nonnegative margins leaving printable area.", false); continue;
+        }
+        GSErrCode err = NoError;
+        const auto existing = FindMasterLayoutDatabaseByName (name, err);
+        if (err != NoError) { fail (err, "Master name lookup failed or is ambiguous.", false); continue; }
+        API_DatabaseInfo database = {};
+        bool created = false;
+        if (existing.HasValue ()) {
+            if (policy != "ReuseIfMatching") { fail (APIERR_BADPARS, "A master with this name already exists.", false); continue; }
+            database = existing.Get ();
+        } else {
+            database.typeID = APIWind_MasterLayoutID;
+            GS::ucscpy (database.name, name.ToUStr ());
+            err = ACAPI_Database_NewDatabase (&database);
+            if (err != NoError) { fail (err, "Native master database creation failed.", false); continue; }
+            created = true;
+        }
+        row.Add ("databaseId", CreateGuidObjectState (DatabaseIdResolver::Instance ().GetIdOfDatabase (database)));
+        API_LayoutInfo actual = {};
+        const GS::OnExit dispose ([&] () { delete actual.customData; });
+        err = ACAPI_Navigator_GetLayoutSets (&actual, &database.databaseUnId);
+        if (err != NoError) { fail (err, "Cannot read master settings; retained database ID is returned.", created); continue; }
+        if (created) {
+            actual.sizeX = desired.sizeX; actual.sizeY = desired.sizeY;
+            actual.leftMargin = desired.leftMargin; actual.rightMargin = desired.rightMargin;
+            actual.topMargin = desired.topMargin; actual.bottomMargin = desired.bottomMargin;
+            err = ACAPI_Navigator_ChangeLayoutSets (&actual, &database.databaseUnId);
+            if (err != NoError) { fail (err, "Master exists but paper settings failed; inspect retained database ID before retrying.", true); continue; }
+            delete actual.customData; actual = {};
+            err = ACAPI_Navigator_GetLayoutSets (&actual, &database.databaseUnId);
+            if (err != NoError) { fail (err, "Master changed but readback failed; inspect retained database ID.", true); continue; }
+        }
+        const auto equal = [] (double a, double b) { return std::isfinite (a) && std::abs (a-b) <= 1e-6; };
+        if (!equal (actual.sizeX, desired.sizeX) || !equal (actual.sizeY, desired.sizeY) ||
+            !equal (actual.leftMargin, desired.leftMargin) || !equal (actual.rightMargin, desired.rightMargin) ||
+            !equal (actual.topMargin, desired.topMargin) || !equal (actual.bottomMargin, desired.bottomMargin)) {
+            fail (APIERR_BADPARS, "Native master paper settings do not match the requested specification.", created); continue;
+        }
+        row.Add ("status", created ? "created" : "reused"); row.Add ("verification", "nativePaperGeometryReadBack"); add (row);
+    }
+    return response;
+}
+
 CreateLayoutCommand::CreateLayoutCommand () :
     CommandBase (CommonSchema::Used)
 {
@@ -261,22 +361,20 @@ GS::Optional<GS::UniString> CreateLayoutCommand::GetInputParametersSchema () con
         "properties": {
             "layoutsData": {
                 "type": "array",
+                "minItems":1, "maxItems":100,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "masterLayoutName":      { "type": "string", "minLength": 1 },
+                        "masterLayoutName":      { "type": "string", "minLength": 1, "maxLength":255 },
                         "masterNavigatorItemId": { "$ref": "#/NavigatorItemId" },
-                        "layoutName":            { "type": "string", "minLength": 1 },
+                        "layoutName":            { "type": "string", "minLength": 1, "maxLength":255 },
+                        "createMissingMaster": {"type":"boolean","default":true,"description":"Legacy default true creates a master with native defaults if the name is missing. Set false for explicit project setup through CreateMasterLayouts. Any new master ID is returned in createdMasterLayouts, including later sheet failure."},
+                        "ifExists": {"type":"string","enum":["Create","Error","ReuseIfMatching"],"description":"Default Create preserves legacy behaviour. Other policies resolve an exact same-name sibling under the parent. Reuse requires the same master and matching supplied numbering/display settings; existing sheets are never modified."},
                         "parentNavigatorItemId": { "$ref": "#/NavigatorItemId" },
                         "layoutParameters": {
                             "type": "object",
+                            "description":"Sheet numbering/display settings. Paper size and margins belong to the master layout: use CreateMasterLayouts or SetLayoutSettings on that master first.",
                             "properties": {
-                                "horizontalSize":           { "type": "number" },
-                                "verticalSize":             { "type": "number" },
-                                "leftMargin":               { "type": "number" },
-                                "topMargin":                { "type": "number" },
-                                "rightMargin":              { "type": "number" },
-                                "bottomMargin":             { "type": "number" },
                                 "customLayoutNumber":       { "type": "string" },
                                 "customLayoutNumbering":    { "type": "boolean" },
                                 "doNotIncludeInNumbering":  { "type": "boolean" },
@@ -286,7 +384,9 @@ GS::Optional<GS::UniString> CreateLayoutCommand::GetInputParametersSchema () con
                         }
                     },
                     "additionalProperties": false,
-                    "required": ["layoutName"]
+                    "required": ["layoutName"],
+                    "oneOf":[{"required":["masterLayoutName"],"not":{"required":["masterNavigatorItemId"]}},
+                             {"required":["masterNavigatorItemId"],"not":{"required":["masterLayoutName"]}}]
                 }
             }
         },
@@ -297,7 +397,13 @@ GS::Optional<GS::UniString> CreateLayoutCommand::GetInputParametersSchema () con
 
 GS::Optional<GS::UniString> CreateLayoutCommand::GetRawResponseSchema () const
 {
-    return CreateDetailsCommand ().GetRawResponseSchema ();
+    return R"({"type":"object","properties":{
+        "databases":{"type":"array","items":{"$ref":"#/DatabaseIdOrError"}},
+        "createdMasterLayouts":{"type":"array","items":{"type":"object","properties":{
+            "databaseId":{"$ref":"#/DatabaseId"},"inputIndex":{"type":"integer"}},"required":["databaseId","inputIndex"],"additionalProperties":false}},
+        "reusedLayouts":{"type":"array","items":{"type":"object","properties":{
+            "databaseId":{"$ref":"#/DatabaseId"},"inputIndex":{"type":"integer"}},"required":["databaseId","inputIndex"],"additionalProperties":false}}
+    },"required":["databases","createdMasterLayouts","reusedLayouts"],"additionalProperties":false})";
 }
 
 GS::ObjectState CreateLayoutCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const
@@ -308,9 +414,46 @@ GS::ObjectState CreateLayoutCommand::Execute (const GS::ObjectState& parameters,
         return errorResponse;
     }
 
-    GS::Array<GS::ObjectState> databases;
+    GS::Array<GS::ObjectState> databases, createdMasters, reusedLayouts;
+    Int32 inputIndex = -1;
     for (const auto& item : items) {
+        ++inputIndex;
+        GS::UniString layoutName, masterName, collisionPolicy = "Create";
+        item.Get ("layoutName", layoutName); item.Get ("masterLayoutName", masterName); item.Get ("ifExists", collisionPolicy);
+        if (layoutName.IsEmpty () || layoutName.GetLength () >= API_UniLongNameLen || masterName.GetLength () >= API_UniLongNameLen ||
+            item.Contains ("masterLayoutName") == item.Contains ("masterNavigatorItemId") ||
+            (collisionPolicy != "Create" && collisionPolicy != "Error" && collisionPolicy != "ReuseIfMatching")) {
+            databases.Push (CreateErrorResponse (APIERR_BADPARS, "Supply valid layout/master names, exactly one master identity, and a supported collision policy.")); continue;
+        }
+        API_Guid parentNavGuid = APINULLGuid;
+        if (const auto* parentOS = item.Get ("parentNavigatorItemId")) {
+            parentNavGuid = GetGuidFromObjectState (*parentOS);
+            if (parentNavGuid == APINULLGuid) { databases.Push (CreateErrorResponse (APIERR_BADPARS, "Invalid layout parent identity.")); continue; }
+        } else {
+            API_NavigatorSet set = {}; set.mapId = API_LayoutMap; Int32 index = 0;
+            const GSErrCode rootError = ACAPI_Navigator_GetNavigatorSet (&set, &index);
+            if (rootError != NoError) { databases.Push (CreateErrorResponse (rootError, "Cannot resolve Layout Book root.")); continue; }
+            parentNavGuid = set.rootGuid;
+        }
+        GS::Optional<API_DatabaseInfo> existingLayout;
+        const GSErrCode siblingError = FindLayoutSibling (parentNavGuid, layoutName, existingLayout);
+        if (siblingError != NoError) { databases.Push (CreateErrorResponse (siblingError, "Invalid parent or ambiguous layout sibling.")); continue; }
+        if (existingLayout.HasValue () && collisionPolicy == "Error") {
+            databases.Push (CreateErrorResponse (APIERR_BADPARS, "A same-name layout already exists under this parent.")); continue;
+        }
         API_DatabaseInfo masterLayoutDbInfo = {};
+        const auto* requestedLayoutParameters = item.Get ("layoutParameters");
+        GS::UniString requestedNumber;
+        API_LayoutInfo stringLimits = {};
+        if (requestedLayoutParameters != nullptr && requestedLayoutParameters->Get ("customLayoutNumber", requestedNumber) &&
+            std::strlen (requestedNumber.ToCStr ().Get ()) >= sizeof (stringLimits.customLayoutNumber)) {
+            databases.Push (CreateErrorResponse (APIERR_BADPARS, "Layout number exceeds native byte capacity; no master or sheet was created.")); continue;
+        }
+        if (requestedLayoutParameters != nullptr && (requestedLayoutParameters->Contains ("horizontalSize") || requestedLayoutParameters->Contains ("verticalSize") ||
+            requestedLayoutParameters->Contains ("leftMargin") || requestedLayoutParameters->Contains ("rightMargin") ||
+            requestedLayoutParameters->Contains ("topMargin") || requestedLayoutParameters->Contains ("bottomMargin"))) {
+            databases.Push (CreateErrorResponse (APIERR_BADPARS, "Paper geometry belongs to the master layout. Use CreateMasterLayouts or modify that master before creating sheets.")); continue;
+        }
 
         const GS::ObjectState* masterNavItemOS = item.Get ("masterNavigatorItemId");
         if (masterNavItemOS != nullptr) {
@@ -322,17 +465,28 @@ GS::ObjectState CreateLayoutCommand::Execute (const GS::ObjectState& parameters,
                 continue;
             }
             masterLayoutDbInfo = masterNavItem.db;
+            if (masterNavItem.itemType != API_MasterLayoutNavItem) {
+                databases.Push (CreateErrorResponse (APIERR_BADPARS, "masterNavigatorItemId must identify a master layout.")); continue;
+            }
         } else {
             GS::UniString masterLayoutName;
             item.Get ("masterLayoutName", masterLayoutName);
 
-            const auto existingMasterLayout = FindMasterLayoutDatabaseByName (masterLayoutName);
+            GSErrCode masterLookupError = NoError;
+            const auto existingMasterLayout = FindMasterLayoutDatabaseByName (masterLayoutName, masterLookupError);
+            if (masterLookupError != NoError) {
+                databases.Push (CreateErrorResponse (masterLookupError, "Cannot resolve an unambiguous master layout name.")); continue;
+            }
             if (existingMasterLayout.HasValue ()) {
                 masterLayoutDbInfo = existingMasterLayout.Get ();
             } else {
                 if (masterLayoutName.IsEmpty ()) {
                     databases.Push (CreateErrorResponse (APIERR_BADPARS, "Either masterLayoutName or masterNavigatorItemId must be provided."));
                     continue;
+                }
+                bool createMissingMaster = true; item.Get ("createMissingMaster", createMissingMaster);
+                if (!createMissingMaster || (existingLayout.HasValue () && collisionPolicy == "ReuseIfMatching")) {
+                    databases.Push (CreateErrorResponse (APIERR_BADPARS, "Requested master does not exist; create it explicitly with CreateMasterLayouts.")); continue;
                 }
                 masterLayoutDbInfo.typeID = APIWind_MasterLayoutID;
                 SetUCharProperty (&item, "masterLayoutName", masterLayoutDbInfo.name);
@@ -342,6 +496,7 @@ GS::ObjectState CreateLayoutCommand::Execute (const GS::ObjectState& parameters,
                     databases.Push (CreateErrorResponse (createMasterErr, "Failed to create master layout."));
                     continue;
                 }
+                createdMasters.Push (GS::ObjectState ("databaseId", CreateGuidObjectState (DatabaseIdResolver::Instance ().GetIdOfDatabase (masterLayoutDbInfo)), "inputIndex", inputIndex));
             }
         }
 
@@ -353,7 +508,12 @@ GS::ObjectState CreateLayoutCommand::Execute (const GS::ObjectState& parameters,
 #endif
 
         API_LayoutInfo masterLayoutInfo = {};
-        if (GetLayoutInfoForDatabase (masterLayoutDbInfo.databaseUnId, masterLayoutInfo)) {
+        const GS::OnExit masterDataCleanup ([&] () { delete masterLayoutInfo.customData; });
+        const GSErrCode masterSettingsError = GetLayoutInfoForDatabase (masterLayoutDbInfo.databaseUnId, masterLayoutInfo);
+        if (masterSettingsError != NoError) {
+            databases.Push (CreateErrorResponse (masterSettingsError, "Cannot read master settings; no sheet was created. Any new master is listed in createdMasterLayouts.")); continue;
+        }
+        {
             layoutInfo.sizeX = masterLayoutInfo.sizeX;
             layoutInfo.sizeY = masterLayoutInfo.sizeY;
             layoutInfo.leftMargin = masterLayoutInfo.leftMargin;
@@ -365,25 +525,36 @@ GS::ObjectState CreateLayoutCommand::Execute (const GS::ObjectState& parameters,
 
         const GS::ObjectState* layoutParamsOS = item.Get ("layoutParameters");
         if (layoutParamsOS != nullptr) {
-            layoutParamsOS->Get ("horizontalSize",           layoutInfo.sizeX);
-            layoutParamsOS->Get ("verticalSize",             layoutInfo.sizeY);
-            layoutParamsOS->Get ("leftMargin",               layoutInfo.leftMargin);
-            layoutParamsOS->Get ("topMargin",                layoutInfo.topMargin);
-            layoutParamsOS->Get ("rightMargin",              layoutInfo.rightMargin);
-            layoutParamsOS->Get ("bottomMargin",             layoutInfo.bottomMargin);
             SetCharProperty (layoutParamsOS, "customLayoutNumber",      layoutInfo.customLayoutNumber);
             layoutParamsOS->Get ("customLayoutNumbering",    layoutInfo.customLayoutNumbering);
             layoutParamsOS->Get ("doNotIncludeInNumbering",  layoutInfo.doNotIncludeInNumbering);
             layoutParamsOS->Get ("displayMasterLayoutBelow", layoutInfo.showMasterBelow);
         }
 
-        API_Guid parentNavGuid = APINULLGuid;
-        const GS::ObjectState* parentOS = item.Get ("parentNavigatorItemId");
-        if (parentOS != nullptr) {
-            parentNavGuid = GetGuidFromObjectState (*parentOS);
+        if (existingLayout.HasValue () && collisionPolicy == "ReuseIfMatching") {
+            API_LayoutInfo actual = {};
+            const GS::OnExit actualCleanup ([&] () { delete actual.customData; });
+            const GSErrCode readError = GetLayoutInfoForDatabase (existingLayout->databaseUnId, actual);
+            if (readError != NoError) { databases.Push (CreateErrorResponse (readError, "Cannot read existing sheet settings for reuse.")); continue; }
+            bool matches = existingLayout->masterLayoutUnId == masterLayoutDbInfo.databaseUnId;
+            if (layoutParamsOS != nullptr) {
+                if (layoutParamsOS->Contains ("customLayoutNumber")) matches &= std::strcmp (actual.customLayoutNumber, layoutInfo.customLayoutNumber) == 0;
+                if (layoutParamsOS->Contains ("customLayoutNumbering")) matches &= actual.customLayoutNumbering == layoutInfo.customLayoutNumbering;
+                if (layoutParamsOS->Contains ("doNotIncludeInNumbering")) matches &= actual.doNotIncludeInNumbering == layoutInfo.doNotIncludeInNumbering;
+                if (layoutParamsOS->Contains ("displayMasterLayoutBelow")) matches &= actual.showMasterBelow == layoutInfo.showMasterBelow;
+            }
+            if (!matches) { databases.Push (CreateErrorResponse (APIERR_BADPARS, "Existing sheet uses a different master or requested settings; it was not modified.")); continue; }
+            const API_Guid existingGuid = DatabaseIdResolver::Instance ().GetIdOfDatabase (existingLayout.Get ());
+            databases.Push (CreateDatabaseIdObjectState (existingGuid));
+            reusedLayouts.Push (GS::ObjectState ("databaseId", CreateGuidObjectState (existingGuid), "inputIndex", inputIndex));
+            continue;
         }
 
-        const GS::Array<API_Guid> before = GetLayoutDatabaseGuids ();
+        GS::Array<API_Guid> before;
+        const GSErrCode beforeError = GetLayoutDatabaseGuids (before);
+        if (beforeError != NoError) {
+            databases.Push (CreateErrorResponse (beforeError, "Cannot enumerate layouts before creation; no layout was created.")); continue;
+        }
 #ifdef ServerMainVers_2700
         const GSErrCode err = ACAPI_Navigator_CreateLayout (&layoutInfo, &masterLayoutDbInfo.databaseUnId,
             (parentNavGuid != APINULLGuid) ? &parentNavGuid : nullptr);
@@ -396,20 +567,22 @@ GS::ObjectState CreateLayoutCommand::Execute (const GS::ObjectState& parameters,
             continue;
         }
 
-        const auto newLayoutGuid = FindNewLayoutDatabaseGuid (before);
+        GSErrCode identityError = NoError;
+        const auto newLayoutGuid = FindNewLayoutDatabaseGuid (before, identityError);
         if (newLayoutGuid.HasValue ()) {
             databases.Push (CreateDatabaseIdObjectState (newLayoutGuid.Get ()));
         } else {
-            const auto layoutGuid = FindLayoutDatabaseGuidByName (GS::UniString (layoutInfo.layoutName));
-            if (layoutGuid.HasValue ()) {
-                databases.Push (CreateDatabaseIdObjectState (layoutGuid.Get ()));
-            } else {
-                databases.Push (CreateErrorResponse (APIERR_GENERAL, "Layout created but could not resolve its database id."));
-            }
+            databases.Push (CreateErrorResponse (identityError != NoError ? identityError : APIERR_GENERAL,
+                "Layout creation ran but exactly one new database identity could not be confirmed. Inspect before retrying; existing same-name layouts are not returned as new."));
         }
     }
 
-    return CreateDatabasesResponse (databases);
+    GS::ObjectState response = CreateDatabasesResponse (databases);
+    const auto& mastersList = response.AddList<GS::ObjectState> ("createdMasterLayouts");
+    for (const auto& master : createdMasters) mastersList (master);
+    const auto& reusedList = response.AddList<GS::ObjectState> ("reusedLayouts");
+    for (const auto& reused : reusedLayouts) reusedList (reused);
+    return response;
 }
 
 CreateLayoutSubsetCommand::CreateLayoutSubsetCommand () :
@@ -568,38 +741,15 @@ GS::Optional<GS::UniString> CreateDrawingsCommand::GetInputParametersSchema () c
                     "properties": {
                         "navigatorItemId": { "$ref": "#/NavigatorItemId" },
                         "layoutDatabaseId": { "$ref": "#/DatabaseId" },
-                        "name": {
-                            "type": "string",
-                            "minLength": 1,
-                            "description": "Custom title name of the new Drawing. Giving a name implies nameType CustomName unless nameType is set explicitly."
-                        },
-                        "nameType": {
-                            "type": "string",
-                            "enum": ["ViewOrSourceFileName", "ViewIdAndName", "CustomName"],
-                            "description": "How the drawing's title name is assembled (Identification tabpage of the Drawing Settings dialog). Defaults to CustomName when name is given, otherwise to the Drawing tool's current default."
-                        },
+                        "name": { "type": "string", "minLength": 1 },
                         "position": { "$ref": "#/Coordinate2D" },
-                        "scale": {
-                            "type": "number",
-                            "exclusiveMinimum": 0.0,
-                            "description": "Scale ratio applied to the drawing relative to its source view (API_DrawingType::ratio). Defaults to 1.0."
-                        },
-                        "angle": {
-                            "type": "number",
-                            "description": "Rotation angle of the drawing in radians. Defaults to the Drawing tool's current default."
-                        },
-                        "drawingScale": {
-                            "type": "number",
-                            "description": "The nominal scale of the drawing. Defaults to the Drawing tool's current default."
-                        },
-                        "modelOffset": {
-                            "$ref": "#/Coordinate2D",
-                            "description": "Offset of the model origin within the drawing. Defaults to the Drawing tool's current default."
-                        },
+                        "scale": { "type": "number", "exclusiveMinimum": 0.0, "description": "Drawing magnification relative to its source; 1 means original size. Defaults to 1." },
+                        "angle": { "type": "number", "description": "Placed drawing rotation in radians. Omitted value uses drawing defaults." },
+                        "modelOffset": { "$ref": "#/Coordinate2D", "description": "Model origin offset within the drawing, in native model coordinates." },
                         "clipPolygon": { "type": "array", "items": { "$ref": "#/Coordinate2D" }, "minItems": 3 }
                     },
                     "additionalProperties": false,
-                    "required": ["navigatorItemId", "position"]
+                    "required": ["navigatorItemId", "name", "position"]
                 }
             }
         },
@@ -610,65 +760,14 @@ GS::Optional<GS::UniString> CreateDrawingsCommand::GetInputParametersSchema () c
 
 GS::Optional<GS::UniString> CreateDrawingsCommand::GetRawResponseSchema () const
 {
-    return R"({"type":"object","properties":{"elements":{"$ref":"#/ElementIdsOrErrors"}},"additionalProperties":false,"required":["elements"]})";
+    return R"({"type":"object","properties":{"elements":{"$ref":"#/ElementIdsOrErrors"},"contextRestorationError":{"type":"object","description":"Creation results remain available, but restoring the original database failed."}},"additionalProperties":false,"required":["elements"]})";
 }
 
-// Tells whether a navigator item can be the source of a Drawing. Only viewpoints and the views
-// saved from them can be placed - containers (folders, subsets, books, the project root), the
-// Layout Book's own items (layouts, master layouts) and the navigator item of an already placed
-// Drawing cannot. Views carry the item type of the viewpoint they were saved from, so the same
-// check covers both the Project Map and the View Map.
-static bool IsPlaceableAsDrawing (API_NavigatorItemTypeID itemType)
+// Creates a single Drawing from a "drawingsData"-shaped item (navigatorItemId, name, position,
+// scale, optional clipPolygon). Shared by CreateDrawingsCommand and ChangeDrawingLinkCommand,
+// which synthesizes the same item shape from an existing Drawing's own current appearance.
+static GS::ObjectState CreateOneDrawing (const GS::ObjectState& item, const API_DrawingType* source = nullptr, API_AddParType** titleParameters = nullptr, const API_ElementMemo* originalClip = nullptr)
 {
-    switch (itemType) {
-        case API_StoryNavItem:
-        case API_SectionNavItem:
-        case API_ElevationNavItem:
-        case API_InteriorElevationNavItem:
-        case API_DetailDrawingNavItem:
-        case API_WorksheetDrawingNavItem:
-        case API_DocumentFrom3DNavItem:
-        case API_PerspectiveNavItem:
-        case API_AxonometryNavItem:
-        case API_ScheduleNavItem:
-        case API_ListNavItem:
-        case API_TextListNavItem:
-        case API_TocNavItem:
-            return true;
-        default:
-            return false;
-    }
-}
-
-// Creates a single Drawing from a "drawingsData"-shaped item (navigatorItemId, position, optional
-// name/nameType/scale/angle/drawingScale/modelOffset/clipPolygon). Shared by CreateDrawingsCommand
-// and ChangeDrawingLinkCommand, which synthesizes the same item shape from an existing Drawing's
-// own current appearance.
-static GS::ObjectState CreateOneDrawing (const GS::ObjectState& item)
-{
-    // The source has to be resolved and checked here, before anything is handed to
-    // ACAPI_Element_Create: a drawingGuid that is not a placeable viewpoint - one that resolves
-    // to nothing, or to a folder, a layout, or an already placed Drawing's own navigator item -
-    // terminates Archicad inside element creation instead of returning an error.
-    const GS::ObjectState* navigatorItemIdState = item.Get ("navigatorItemId");
-    if (navigatorItemIdState == nullptr) {
-        return CreateErrorResponse (APIERR_BADPARS, "Missing required field 'navigatorItemId'.");
-    }
-
-    API_Guid sourceGuid = GetGuidFromObjectState (*navigatorItemIdState);
-    if (sourceGuid == APINULLGuid) {
-        return CreateErrorResponse (APIERR_BADPARS, "navigatorItemId is corrupt or missing.");
-    }
-
-    API_NavigatorItem sourceItem = {};
-    const GSErrCode navErr = ACAPI_Navigator_GetNavigatorItem (&sourceGuid, &sourceItem);
-    if (navErr != NoError) {
-        return CreateErrorResponse (navErr, "Failed to get navigator item from navigatorItemId.");
-    }
-    if (!IsPlaceableAsDrawing (sourceItem.itemType)) {
-        return CreateErrorResponse (APIERR_BADID, "navigatorItemId is not a view or viewpoint that can be placed as a Drawing.");
-    }
-
     API_Element element = {};
 #ifdef ServerMainVers_2600
     element.header.type   = API_DrawingID;
@@ -680,26 +779,40 @@ static GS::ObjectState CreateOneDrawing (const GS::ObjectState& item)
         return CreateErrorResponse (err, "Failed to get drawing defaults.");
     }
 
-    element.drawing.drawingGuid = sourceGuid;
-    // An explicit nameType wins; a name alone means CustomName (the historic behavior of this
-    // command, when name was required); with neither, the Drawing tool's default is kept.
-    const bool hasName = SetCharProperty (&item, "name", element.drawing.name);
-    GS::UniString nameTypeStr;
-    if (item.Get ("nameType", nameTypeStr)) {
-        element.drawing.nameType = DrawingNameTypeFromString (nameTypeStr, element.drawing.nameType);
-    } else if (hasName) {
-        element.drawing.nameType = APIName_CustomName;
-    }
+    element.drawing.drawingGuid = GetGuidFromObjectState (*item.Get ("navigatorItemId"));
+    SetCharProperty (&item, "name", element.drawing.name);
+    element.drawing.nameType = APIName_CustomName;
     element.drawing.anchorPoint = APIAnc_MM;
+    if (source != nullptr) {
+        // Copy writable appearance fields explicitly; never copy cached data or output-only scale.
+        element.header.layer = source->head.layer;
+        element.drawing.isCutWithFrame = source->isCutWithFrame;
+        element.drawing.nameType = source->nameType;
+        element.drawing.numberingType = source->numberingType;
+        std::memcpy (element.drawing.customNumber, source->customNumber, sizeof (element.drawing.customNumber));
+        element.drawing.isInNumbering = source->isInNumbering;
+        element.drawing.manualUpdate = source->manualUpdate;
+        element.drawing.includeInAutoTextsAndIES = source->includeInAutoTextsAndIES;
+        element.drawing.rasterizeDPI = source->rasterizeDPI;
+        element.drawing.anchorPoint = source->anchorPoint;
+        element.drawing.useOwnOrigoAsAnchor = source->useOwnOrigoAsAnchor;
+        element.drawing.colorMode = source->colorMode;
+        element.drawing.penTableUsageMode = source->penTableUsageMode;
+        element.drawing.penTableIndex = source->penTableIndex;
+        element.drawing.isTransparentBk = source->isTransparentBk;
+        element.drawing.hasBorderLine = source->hasBorderLine;
+        element.drawing.borderLineType = source->borderLineType;
+        element.drawing.borderPen = source->borderPen;
+        element.drawing.borderSize = source->borderSize;
+        element.drawing.title = source->title;
+        element.drawing.title.guid = APINULLGuid;
+    }
     element.drawing.pos = Get2DCoordinateFromObjectState (*item.Get ("position"));
     if (!item.Get ("scale", element.drawing.ratio)) {
         element.drawing.ratio = 1.0;
     }
-    // Optional; these must be set at creation time rather than via a follow-up
-    // ACAPI_Element_Change (changing an element immediately after creating it, within the same
-    // undoable command, is unreliable) - which is also why ChangeDrawingLink passes them here.
+    // Set placement during creation; drawingScale is SDK output-only and comes from the source view.
     item.Get ("angle", element.drawing.angle);
-    item.Get ("drawingScale", element.drawing.drawingScale);
     const GS::ObjectState* modelOffsetState = item.Get ("modelOffset");
     if (modelOffsetState != nullptr) {
         element.drawing.modelOffset = Get2DCoordinateFromObjectState (*modelOffsetState);
@@ -715,23 +828,22 @@ static GS::ObjectState CreateOneDrawing (const GS::ObjectState& item)
             clipCoords.Pop ();
     }
     const Int32 nClip = (Int32) clipCoords.GetSize ();
+    if (item.Contains ("clipPolygon") && nClip < 3) {
+        return CreateErrorResponse (APIERR_BADPARS, "Drawing clip polygon needs at least three vertices after removing its closing duplicate.");
+    }
 
     API_ElementMemo memo = {};
-    if (nClip < 3) {
-        // No clip polygon requested. ACAPI_Element_GetDefaults filled isCutWithFrame from the
-        // Drawing tool defaults, which carry over the crop of the last manually placed Drawing -
-        // clear it explicitly so the new Drawing always shows its full, unclipped extent (#651).
-        element.drawing.isCutWithFrame = false;
-        element.drawing.poly.nSubPolys = 0;
-        element.drawing.poly.nCoords   = 0;
-        element.drawing.poly.nArcs     = 0;
-    } else {
+    if (nClip >= 3) {
         element.drawing.isCutWithFrame = true;
         element.drawing.poly.nSubPolys = 1;
         element.drawing.poly.nCoords   = nClip + 1;
         element.drawing.poly.nArcs     = 0;
         memo.coords = reinterpret_cast<API_Coord**> (BMAllocateHandle ((nClip + 2) * sizeof (API_Coord), ALLOCATE_CLEAR, 0));
         memo.pends  = reinterpret_cast<Int32**>     (BMAllocateHandle (2 * sizeof (Int32), ALLOCATE_CLEAR, 0));
+        if (memo.coords == nullptr || memo.pends == nullptr) {
+            ACAPI_DisposeElemMemoHdls (&memo);
+            return CreateErrorResponse (APIERR_MEMFULL, "Cannot allocate drawing clip polygon.");
+        }
         if (memo.coords != nullptr && memo.pends != nullptr) {
             for (Int32 i = 0; i < nClip; ++i)
                 (*memo.coords)[i + 1] = Get2DCoordinateFromObjectState (clipCoords[i]);
@@ -739,7 +851,21 @@ static GS::ObjectState CreateOneDrawing (const GS::ObjectState& item)
             (*memo.pends)[1] = nClip + 1;
         }
     }
+    // Borrow the original title parameters for this synchronous call. The
+    // caller's original memo retains ownership of all nested parameter arrays.
+    const bool borrowClip=source!=nullptr && source->isCutWithFrame && originalClip!=nullptr;
+    if (borrowClip) {
+        // Original native contours and arc sweeps are passed without flattening.
+        // Only the temporary clip allocated above belongs to this memo.
+        BMKillHandle(reinterpret_cast<GSHandle*>(&memo.coords));
+        BMKillHandle(reinterpret_cast<GSHandle*>(&memo.pends));
+        element.drawing.poly=source->poly;
+        memo.coords=originalClip->coords; memo.pends=originalClip->pends; memo.parcs=originalClip->parcs;
+    }
+    memo.params=titleParameters;
     err = ACAPI_Element_Create (&element, &memo);
+    memo.params=nullptr;
+    if (borrowClip) { memo.coords=nullptr; memo.pends=nullptr; memo.parcs=nullptr; }
     ACAPI_DisposeElemMemoHdls (&memo);
 
     if (err != NoError) {
@@ -775,19 +901,18 @@ GS::ObjectState CreateDrawingsCommand::Execute (const GS::ObjectState& parameter
 
     API_DatabaseInfo startingDatabase = {};
     const GSErrCode startingDatabaseErr = ACAPI_Database_GetCurrentDatabase (&startingDatabase);
-
+    if (startingDatabaseErr != NoError) return CreateErrorResponse (startingDatabaseErr, "Cannot establish the starting drawing database; nothing was created.");
     GS::Array<GS::ObjectState> elementResults;
     const GSErrCode undoErr = ACAPI_CallUndoableCommand ("CreateDrawingsCommand", [&]() -> GSErrCode {
         for (const auto& item : items) {
-            if (startingDatabaseErr == NoError) {
-                const GS::ObjectState* layoutDatabaseId = item.Get ("layoutDatabaseId");
-                if (layoutDatabaseId != nullptr) {
-                    const GSErrCode err = ActivateLayoutDatabase (GetGuidFromObjectState (*layoutDatabaseId));
-                    if (err != NoError) {
-                        elementResults.Push (CreateErrorResponse (err, "Failed to activate the layout database."));
-                        continue;
-                    }
-                }
+            const GS::ObjectState* layoutDatabaseId = item.Get ("layoutDatabaseId");
+            // Omission means the original database, never the previous item's layout.
+            const GSErrCode contextErr = layoutDatabaseId != nullptr
+                ? ActivateLayoutDatabase (GetGuidFromObjectState (*layoutDatabaseId))
+                : ACAPI_Database_ChangeCurrentDatabase (&startingDatabase);
+            if (contextErr != NoError) {
+                elementResults.Push (CreateErrorResponse (contextErr, "Failed to activate the drawing database."));
+                continue;
             }
 
             elementResults.Push (CreateOneDrawing (item));
@@ -796,14 +921,15 @@ GS::ObjectState CreateDrawingsCommand::Execute (const GS::ObjectState& parameter
         return NoError;
     });
 
-    if (startingDatabaseErr == NoError) {
-        ACAPI_Database_ChangeCurrentDatabase (&startingDatabase);
-    }
+    const GSErrCode restoreErr = ACAPI_Database_ChangeCurrentDatabase (&startingDatabase);
     if (undoErr != NoError) {
-        elementResults.Push (CreateErrorResponse (undoErr, "Failed to execute command in undo scope."));
+        elementResults.Clear ();
+        for (UIndex index = 0; index < items.GetSize (); ++index)
+            elementResults.Push (CreateErrorResponse (undoErr, "Drawing transaction failed; creation is not confirmed."));
     }
 
     GS::ObjectState response;
+    if (restoreErr != NoError) response.Add ("contextRestorationError", *CreateErrorResponse (restoreErr, "Could not restore the original database; inspect context before continuing.").Get ("error"));
     const auto& elements = response.AddList<GS::ObjectState> ("elements");
     for (const auto& elementResult : elementResults) {
         elements (elementResult);
@@ -823,15 +949,14 @@ GS::ObjectState CreateDrawingsCommand::Execute (const GS::ObjectState& parameter
 // then delete the old one. The new Drawing necessarily gets a new guid - any external
 // references to the old guid (dimensions, markers, IDs) will need updating separately.
 //
-// All of the old Drawing's appearance (pos, angle, ratio, drawingScale, modelOffset,
-// nameType, clipPolygon) is set on the new element BEFORE creation (via CreateOneDrawing), not through
+// Selected old Drawing placement fields (pos, angle, ratio, modelOffset,
+// clipPolygon) is set on the new element BEFORE creation (via CreateOneDrawing), not through
 // a follow-up ACAPI_Element_Change - calling Change on an element immediately after creating
 // it, within the same undoable command, crashed Archicad's command layer in testing.
 //
-// Known gap: the Drawing Title marker's own position (a "Neig" sub-element,
-// APINeig_DrawingTitle) is not carried over. Neither the ACAPI documentation nor
-// Graphisoft's own support responses address this - it appears to be an unresolved,
-// undocumented corner of the API rather than something this command works around.
+// Title parameters are copied, but title position is not silently claimed as preserved.
+// Source and replacement title points are returned for a separate, revision-checked
+// PositionDrawingTitles call after creation completes. Native/visual acceptance is pending.
 // ============================================================================
 
 ChangeDrawingLinkCommand::ChangeDrawingLinkCommand () :
@@ -851,6 +976,7 @@ GS::Optional<GS::UniString> ChangeDrawingLinkCommand::GetInputParametersSchema (
         "properties": {
             "drawingsWithNewLinks": {
                 "type": "array",
+                "minItems": 1, "maxItems": 100,
                 "items": {
                     "type": "object",
                     "description": "An existing Drawing and the navigator item it should be relinked to.",
@@ -871,128 +997,197 @@ GS::Optional<GS::UniString> ChangeDrawingLinkCommand::GetInputParametersSchema (
 
 GS::Optional<GS::UniString> ChangeDrawingLinkCommand::GetRawResponseSchema () const
 {
-    return R"({
-        "type": "object",
-        "properties": {
-            "elements": {
-                "type": "array",
-                "description": "One result per input item. On success, elementId is the NEW Drawing's identifier - relinking necessarily replaces the element, it cannot keep the original guid.",
-                "items": {
-                    "$ref": "#/ElementIdOrError"
-                }
-            }
-        },
-        "additionalProperties": false,
-        "required": ["elements"]
-    })";
+    return R"({"type":"object","properties":{
+        "elements":{"$ref":"#/ElementIdsOrErrors"},
+        "transactionStatus":{"type":"string","enum":["committed","failed"]},
+        "replacements":{"type":"array","description":"Attempted old/new ID mappings. On a failed transaction these are diagnostic only and may no longer exist.","items":{
+            "type":"object","properties":{"oldElementId":{"$ref":"#/ElementId"},"newElementId":{"$ref":"#/ElementId"},"sourceTitlePlacement":{"type":"object"},"replacementTitlePlacement":{"type":"object"},"titleParametersSupplied":{"type":"boolean","description":"Original title parameters were supplied to native creation; this is not independent readback verification."},"clipPreserved":{"type":"boolean"}},
+            "required":["oldElementId","newElementId"],"additionalProperties":false}},
+        "titleParametersAndPlacementNotPreserved":{"type":"boolean"},
+        "failedInputIndex":{"type":"integer","minimum":0},
+        "failurePhase":{"type":"string"},
+        "contextRestorationError":{"type":"object"}
+    },"required":["elements","transactionStatus","replacements","titleParametersAndPlacementNotPreserved"],"additionalProperties":false})";
 }
 
-GS::ObjectState ChangeDrawingLinkCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const
+// 19 September 2026, 19:40 CEST. Preserve measured title points for a separate
+// PositionDrawingTitles request after relinking has completed. Do not mutate a
+// replacement title in the transaction that created its drawing.
+static GS::ObjectState DrawingTitlePoints (const API_Guid& drawing)
+{
+    GS::Array<API_ElementHotspot> hotspots;
+    const auto error=ACAPI_Element_GetHotspots(drawing,&hotspots);
+    if (error!=NoError) return CreateErrorResponse(error,"Cannot inspect drawing title placement points.");
+    if (hotspots.GetSize()>10000) return CreateErrorResponse(APIERR_BADPARS,"Drawing hotspot count exceeds the inspection bound.");
+    GS::Array<GS::ObjectState> points;
+    for (UIndex index=0;index<hotspots.GetSize();++index) {
+        const auto& point=hotspots[index];
+        if (point.first.guid!=drawing || point.first.neigID!=APINeig_DrawingTitle) continue;
+        if (!std::isfinite(point.second.x) || !std::isfinite(point.second.y) || points.GetSize()>=100)
+            return CreateErrorResponse(APIERR_BADPARS,"Title placement points are invalid or exceed 100 entries.");
+        points.Push(GS::ObjectState("hotspotIndex",index,"nativeSubIndex",point.first.inIndex,
+            "nativePartType",static_cast<Int32>(point.first.elemPartType),"nativePartIndex",point.first.elemPartIndex,
+            "positionMillimetres",GS::ObjectState("x",point.second.x*1000,"y",point.second.y*1000)));
+    }
+    return GS::ObjectState("points",points);
+}
+static GSErrCode ConfirmDrawingClip (const API_Element& original,const API_ElementMemo& oldMemo,const API_Guid& replacement)
+{
+    API_Element current={}; current.header.guid=replacement;
+    auto error=ACAPI_Element_Get(&current);
+    if (error!=NoError) return error;
+    if (GetElemTypeId(current.header)!=API_DrawingID || current.drawing.isCutWithFrame!=original.drawing.isCutWithFrame) return APIERR_GENERAL;
+    if (!original.drawing.isCutWithFrame) return NoError;
+    const auto& expected=original.drawing.poly; const auto& actual=current.drawing.poly;
+    if (expected.nCoords!=actual.nCoords || expected.nSubPolys!=actual.nSubPolys || expected.nArcs!=actual.nArcs) return APIERR_GENERAL;
+    API_ElementMemo memo={};
+    const GS::OnExit dispose([&] { ACAPI_DisposeElemMemoHdls(&memo); });
+    error=ACAPI_Element_GetMemo(replacement,&memo,APIMemoMask_Polygon);
+    if (error!=NoError) return error;
+    if (memo.coords==nullptr || memo.pends==nullptr || BMhGetSize(reinterpret_cast<GSHandle>(memo.coords))<static_cast<GSSize>((actual.nCoords+1)*sizeof(API_Coord)) ||
+        BMhGetSize(reinterpret_cast<GSHandle>(memo.pends))<static_cast<GSSize>((actual.nSubPolys+1)*sizeof(Int32))) return APIERR_BADPOLY;
+    for (Int32 i=1;i<=actual.nCoords;++i) {
+        const auto a=(*memo.coords)[i],b=(*oldMemo.coords)[i];
+        if (!std::isfinite(a.x) || !std::isfinite(a.y) || std::hypot(a.x-b.x,a.y-b.y)>1e-8) return APIERR_GENERAL;
+    }
+    for (Int32 i=1;i<=actual.nSubPolys;++i) if ((*memo.pends)[i]!=(*oldMemo.pends)[i]) return APIERR_GENERAL;
+    if (actual.nArcs>0) {
+        if (memo.parcs==nullptr || BMhGetSize(reinterpret_cast<GSHandle>(memo.parcs))<static_cast<GSSize>(actual.nArcs*sizeof(API_PolyArc))) return APIERR_BADPOLY;
+        for (Int32 i=0;i<actual.nArcs;++i) {
+            const auto& a=(*memo.parcs)[i]; const auto& b=(*oldMemo.parcs)[i];
+            if (a.begIndex!=b.begIndex || a.endIndex!=b.endIndex || !std::isfinite(a.arcAngle) || std::abs(a.arcAngle-b.arcAngle)>1e-10) return APIERR_GENERAL;
+        }
+    }
+    return NoError;
+}
+
+GS::ObjectState ChangeDrawingLinkCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& control) const
 {
     GS::Array<GS::ObjectState> items;
-    GS::ObjectState errorResponse;
-    if (!GetItems (parameters, "drawingsWithNewLinks", items, errorResponse)) {
-        return errorResponse;
+    parameters.Get ("drawingsWithNewLinks", items);
+    if (items.IsEmpty () || items.GetSize () > 100)
+        return CreateErrorResponse (APIERR_BADPARS, "Supply between 1 and 100 drawings to relink.");
+    GS::HashSet<API_Guid> seen;
+    for (const auto& item : items) {
+        const API_Guid guid = GetGuidFromArrayItem ("elementId", item);
+        if (guid == APINULLGuid || seen.Contains (guid) || item.Get ("navigatorItemId") == nullptr || item.Get ("layoutDatabaseId") == nullptr)
+            return CreateErrorResponse (APIERR_BADPARS, "Each drawing must occur once with a source and layout database.");
+        seen.Add (guid);
     }
-
     API_DatabaseInfo startingDatabase = {};
-    const GSErrCode startingDatabaseErr = ACAPI_Database_GetCurrentDatabase (&startingDatabase);
-
-    GS::Array<GS::ObjectState> results;
-    const GSErrCode undoErr = ACAPI_CallUndoableCommand ("ChangeDrawingLinkCommand", [&]() -> GSErrCode {
+    GSErrCode err = ACAPI_Database_GetCurrentDatabase (&startingDatabase);
+    if (err != NoError) return CreateErrorResponse (err, "Cannot establish the starting database; no relinking attempted.");
+    GS::Array<GS::ObjectState> results, replacements;
+    Int32 inputIndex = -1;
+    GS::UniString phase = "startTransaction";
+    const GSErrCode transaction = ACAPI_CallUndoableCommand ("ChangeDrawingLinkCommand", [&]() -> GSErrCode {
         for (const auto& item : items) {
-            const GS::ObjectState* elementIdState        = item.Get ("elementId");
-            const GS::ObjectState* navigatorItemIdState  = item.Get ("navigatorItemId");
-            const GS::ObjectState* layoutDatabaseIdState = item.Get ("layoutDatabaseId");
-            if (elementIdState == nullptr || navigatorItemIdState == nullptr || layoutDatabaseIdState == nullptr) {
-                results.Push (CreateErrorResponse (APIERR_BADPARS, "elementId, navigatorItemId and layoutDatabaseId are all required."));
-                continue;
-            }
-
-            const API_Guid oldGuid = GetGuidFromObjectState (*elementIdState);
-
+            ++inputIndex;
+            phase="checkCancellation";
+            if (control.TestBreak()) return APIERR_CANCEL;
+            phase = "activateLayout";
+            err = ActivateLayoutDatabase (GetGuidFromObjectState (*item.Get ("layoutDatabaseId")));
+            if (err != NoError) return err;
+            phase = "readOriginalDrawing";
+            const API_Guid oldGuid = GetGuidFromArrayItem ("elementId", item);
             API_Element oldElement = {};
             oldElement.header.guid = oldGuid;
-            GSErrCode err = ACAPI_Element_Get (&oldElement);
-            if (err != NoError) {
-                results.Push (CreateErrorResponse (err, "Failed to find the Drawing to relink."));
-                continue;
+            err = ACAPI_Element_Get (&oldElement);
+            if (err != NoError) return err;
+            if (GetElemTypeId (oldElement.header) != API_DrawingID) return APIERR_BADID;
+            phase = "checkEditAccess";
+            if (!ACAPI_Element_Filter (oldGuid, APIFilt_IsEditable | APIFilt_InMyWorkspace | APIFilt_HasAccessRight))
+                return APIERR_NOACCESSRIGHT;
+            API_ElementMemo oldMemo = {}, titleMemo = {};
+            const GS::OnExit dispose ([&] () { ACAPI_DisposeElemMemoHdls (&oldMemo); ACAPI_DisposeElemMemoHdls (&titleMemo); });
+            phase = "readTitleParametersAndClip";
+            err = ACAPI_Element_GetMemo (oldGuid, &oldMemo, APIMemoMask_AddPars | APIMemoMask_Polygon);
+            if (err != NoError) return err;
+            API_AddParType** titleParameters=oldMemo.params;
+            if (oldElement.drawing.title.libInd>0 && titleParameters==nullptr) {
+                // Refuse to silently replace a configured title with its defaults.
+                if (oldElement.drawing.title.guid==APINULLGuid) return APIERR_GENERAL;
+                err=ACAPI_Element_GetMemo (oldElement.drawing.title.guid,&titleMemo,APIMemoMask_AddPars);
+                if (err!=NoError || titleMemo.params==nullptr) return err==NoError?APIERR_GENERAL:err;
+                titleParameters=titleMemo.params;
             }
-#ifdef ServerMainVers_2600
-            if (oldElement.header.type != API_DrawingID) {
-#else
-            if (oldElement.header.typeID != API_DrawingID) {
-#endif
-                results.Push (CreateErrorResponse (APIERR_BADID, "The given element is not a Drawing."));
-                continue;
-            }
-
-            // Capture the old Drawing's clip polygon (if any) before it's deleted.
-            GS::Array<GS::ObjectState> oldClipCoords;
+            if (oldElement.drawing.isMultiPageDrawing) { phase="unsupportedMultiPageDrawing"; return APIERR_BADPARS; }
             if (oldElement.drawing.isCutWithFrame) {
-                GS::ObjectState oldClip;
-                AddPolygonFromMemoCoords (oldGuid, oldClip, "clipPolygon");
-                oldClip.Get ("clipPolygon", oldClipCoords);
-            }
-
-            if (startingDatabaseErr == NoError) {
-                err = ActivateLayoutDatabase (GetGuidFromObjectState (*layoutDatabaseIdState));
-                if (err != NoError) {
-                    results.Push (CreateErrorResponse (err, "Failed to activate the layout database."));
-                    continue;
+                phase = "readNativeClipPolygon";
+                const auto& poly=oldElement.drawing.poly;
+                if (poly.nCoords<4 || poly.nCoords>10000 || poly.nSubPolys<1 || poly.nSubPolys>poly.nCoords/4 || poly.nArcs<0 || poly.nArcs>poly.nCoords ||
+                    oldMemo.coords==nullptr || oldMemo.pends==nullptr ||
+                    BMhGetSize(reinterpret_cast<GSHandle>(oldMemo.coords))<static_cast<GSSize>((poly.nCoords+1)*sizeof(API_Coord)) ||
+                    BMhGetSize(reinterpret_cast<GSHandle>(oldMemo.pends))<static_cast<GSSize>((poly.nSubPolys+1)*sizeof(Int32))) return APIERR_BADPOLY;
+                Int32 previous=0;
+                for (Int32 contour=1;contour<=poly.nSubPolys;++contour) {
+                    const Int32 end=(*oldMemo.pends)[contour];
+                    if (end-previous<4 || end>poly.nCoords) return APIERR_BADPOLY;
+                    if (!IsSame2DCoordinate((*oldMemo.coords)[previous+1],(*oldMemo.coords)[end])) return APIERR_BADPOLY;
+                    previous=end;
+                }
+                if (previous!=poly.nCoords) return APIERR_BADPOLY;
+                for (Int32 i=1;i<=poly.nCoords;++i) if (!std::isfinite((*oldMemo.coords)[i].x) || !std::isfinite((*oldMemo.coords)[i].y)) return APIERR_BADPOLY;
+                if (poly.nArcs>0) {
+                    if (oldMemo.parcs==nullptr || BMhGetSize(reinterpret_cast<GSHandle>(oldMemo.parcs))<static_cast<GSSize>(poly.nArcs*sizeof(API_PolyArc))) return APIERR_BADPOLY;
+                    for (Int32 i=0;i<poly.nArcs;++i) {
+                        const auto& arc=(*oldMemo.parcs)[i];
+                        if (arc.begIndex<1 || arc.begIndex>poly.nCoords || arc.endIndex<1 || arc.endIndex>poly.nCoords || !std::isfinite(arc.arcAngle)) return APIERR_BADPOLY;
+                    }
                 }
             }
-
-            GS::ObjectState newDrawingItem;
-            newDrawingItem.Add ("navigatorItemId", *navigatorItemIdState);
-            newDrawingItem.Add ("name", GS::UniString (oldElement.drawing.name));
-            newDrawingItem.Add ("nameType", DrawingNameTypeToString (oldElement.drawing.nameType));
-            newDrawingItem.Add ("position", Create2DCoordinateObjectState (oldElement.drawing.pos));
-            newDrawingItem.Add ("scale", oldElement.drawing.ratio);
-            newDrawingItem.Add ("angle", oldElement.drawing.angle);
-            newDrawingItem.Add ("drawingScale", oldElement.drawing.drawingScale);
-            newDrawingItem.Add ("modelOffset", Create2DCoordinateObjectState (oldElement.drawing.modelOffset));
-            if (!oldClipCoords.IsEmpty ()) {
-                const auto& clipList = newDrawingItem.AddList<GS::ObjectState> ("clipPolygon");
-                for (const auto& coord : oldClipCoords) {
-                    clipList (coord);
-                }
+            GS::ObjectState replacement;
+            replacement.Add ("navigatorItemId", *item.Get ("navigatorItemId"));
+            replacement.Add ("name", GS::UniString (oldElement.drawing.name));
+            replacement.Add ("position", Create2DCoordinateObjectState (oldElement.drawing.pos));
+            replacement.Add ("scale", oldElement.drawing.ratio);
+            replacement.Add ("angle", oldElement.drawing.angle);
+            replacement.Add ("modelOffset", Create2DCoordinateObjectState (oldElement.drawing.modelOffset));
+            const auto sourceTitlePlacement=DrawingTitlePoints(oldGuid);
+            phase = "createReplacement";
+            const auto created = CreateOneDrawing (replacement, &oldElement.drawing, titleParameters, &oldMemo);
+            const auto* newId = created.Get ("elementId");
+            if (newId == nullptr) {
+                if (const auto* failure = created.Get ("error")) failure->Get ("code", err);
+                return err == NoError ? APIERR_GENERAL : err;
             }
-
-            const GS::ObjectState createResult = CreateOneDrawing (newDrawingItem);
-            const GS::ObjectState* newElementIdState = createResult.Get ("elementId");
-            if (newElementIdState == nullptr) {
-                results.Push (createResult);
-                continue;
-            }
-            const API_Guid newGuid = GetGuidFromObjectState (*newElementIdState);
+            const API_Guid newGuid = GetGuidFromObjectState (*newId);
+            GS::ObjectState mapping("oldElementId",CreateGuidObjectState(oldGuid),"newElementId",CreateGuidObjectState(newGuid),
+                "sourceTitlePlacement",sourceTitlePlacement,"replacementTitlePlacement",DrawingTitlePoints(newGuid),
+                "titleParametersSupplied",titleParameters!=nullptr);
+            phase="confirmReplacementClip";
+            err=ConfirmDrawingClip(oldElement,oldMemo,newGuid);
+            mapping.Add("clipPreserved",err==NoError);
+            replacements.Push(mapping);
+            if (err!=NoError) return err;
 
             GS::Array<API_Guid> toDelete;
             toDelete.Push (oldGuid);
+            phase = "deleteOriginal";
             err = ACAPI_Element_Delete (toDelete);
-            if (err != NoError) {
-                results.Push (CreateErrorResponse (err, "The relinked Drawing was created, but the old one could not be deleted."));
-                continue;
-            }
-
+            if (err != NoError) return err; // Abort the batch rather than commit a duplicate drawing.
             results.Push (CreateElementIdObjectState (newGuid));
         }
-
+        phase = "commitTransaction";
         return NoError;
     });
-
-    if (startingDatabaseErr == NoError) {
-        ACAPI_Database_ChangeCurrentDatabase (&startingDatabase);
+    const GSErrCode restore = ACAPI_Database_ChangeCurrentDatabase (&startingDatabase);
+    if (transaction != NoError) {
+        results.Clear ();
+        for (UIndex index = 0; index < items.GetSize (); ++index)
+            results.Push (CreateErrorResponse (transaction, "Relink transaction failed. No replacement is confirmed; inspect diagnostic IDs before retrying. Multi-page drawings are rejected rather than reduced to a single page."));
     }
-    if (undoErr != NoError) {
-        results.Push (CreateErrorResponse (undoErr, "Failed to execute command in undo scope."));
+    GS::ObjectState response ("transactionStatus", transaction == NoError ? "committed" : "failed",
+        "titleParametersAndPlacementNotPreserved", true);
+    if (transaction != NoError) {
+        response.Add ("failurePhase", phase);
+        if (inputIndex >= 0) response.Add ("failedInputIndex", inputIndex);
     }
-
-    GS::ObjectState response;
-    const auto& elements = response.AddList<GS::ObjectState> ("elements");
-    for (const auto& result : results) {
-        elements (result);
-    }
+    const auto& addResult = response.AddList<GS::ObjectState> ("elements");
+    for (const auto& result : results) addResult (result);
+    const auto& addReplacement = response.AddList<GS::ObjectState> ("replacements");
+    for (const auto& replacement : replacements) addReplacement (replacement);
+    if (restore != NoError) response.Add ("contextRestorationError", *CreateErrorResponse (restore, "Could not restore the original database.").Get ("error"));
     return response;
 }
 
@@ -1211,6 +1406,7 @@ GS::Optional<GS::UniString> SetLayoutSettingsCommand::GetInputParametersSchema (
                         "customLayoutNumbering":    { "type": "boolean" },
                         "doNotIncludeInNumbering":  { "type": "boolean" },
                         "showMasterBelow":          { "type": "boolean" },
+                        "customDataMode": {"type":"string","enum":["Replace","Merge"],"description":"Replace retains legacy behaviour (default). Merge updates supplied fields and retains all other layout custom fields."},
                         "customData": {
                             "type": "array",
                             "items": {
@@ -1225,7 +1421,10 @@ GS::Optional<GS::UniString> SetLayoutSettingsCommand::GetInputParametersSchema (
                             }
                         }
                     },
-                    "additionalProperties": false
+                    "additionalProperties": false,
+                    "oneOf":[{"required":["layoutDatabaseId"],"not":{"required":["layoutNavigatorItemId"]}},
+                             {"required":["layoutNavigatorItemId"],"not":{"required":["layoutDatabaseId"]}}],
+                    "dependencies":{"customDataMode":["customData"]}
                 }
             }
         },
@@ -1275,6 +1474,15 @@ GS::ObjectState SetLayoutSettingsCommand::Execute (const GS::ObjectState& parame
 
         const GS::ObjectState* navIdOS = item.Get ("layoutNavigatorItemId");
         const GS::ObjectState* dbIdOS  = item.Get ("layoutDatabaseId");
+        if ((navIdOS != nullptr) == (dbIdOS != nullptr) || (item.Contains ("customDataMode") && !item.Contains ("customData"))) {
+            executionResults.Push (CreateFailedExecutionResult (APIERR_BADPARS, "Specify exactly one layout identity; customDataMode requires customData.")); continue;
+        }
+        GS::UniString requestedName, requestedNumber;
+        API_LayoutInfo stringLimits = {};
+        if ((item.Get ("layoutName", requestedName) && (requestedName.IsEmpty () || requestedName.GetLength () >= API_UniLongNameLen)) ||
+            (item.Get ("customLayoutNumber", requestedNumber) && std::strlen (requestedNumber.ToCStr ().Get ()) >= sizeof (stringLimits.customLayoutNumber))) {
+            executionResults.Push (CreateFailedExecutionResult (APIERR_BADPARS, "Layout name or number is empty or exceeds native capacity.")); continue;
+        }
 
         if (navIdOS != nullptr) {
             API_Guid navGuid = GetGuidFromObjectState (*navIdOS);
@@ -1285,10 +1493,20 @@ GS::ObjectState SetLayoutSettingsCommand::Execute (const GS::ObjectState& parame
                 continue;
             }
             dbInfo = navItem.db;
+            if (navItem.itemType != API_MasterLayoutNavItem && navItem.itemType != API_LayoutNavItem) {
+                executionResults.Push (CreateFailedExecutionResult (APIERR_BADPARS, "Navigator identity is not a layout or master.")); continue;
+            }
             isMasterLayout = (navItem.itemType == API_MasterLayoutNavItem);
         } else if (dbIdOS != nullptr) {
             dbInfo = DatabaseIdResolver::Instance ().GetDatabaseWithId (GetGuidFromObjectState (*dbIdOS));
-            isMasterLayout = IsMasterLayoutDatabase (dbInfo.databaseUnId);
+            const GSErrCode databaseError = ACAPI_Window_GetDatabaseInfo (&dbInfo);
+            if (databaseError != NoError) {
+                executionResults.Push (CreateFailedExecutionResult (databaseError, "Cannot resolve layout database.")); continue;
+            }
+            if (dbInfo.typeID != APIWind_MasterLayoutID && dbInfo.typeID != APIWind_LayoutID) {
+                executionResults.Push (CreateFailedExecutionResult (APIERR_BADPARS, "Database identity is not a layout or master.")); continue;
+            }
+            isMasterLayout = dbInfo.typeID == APIWind_MasterLayoutID;
         } else {
             executionResults.Push (CreateFailedExecutionResult (APIERR_BADPARS, "Missing layoutDatabaseId or layoutNavigatorItemId."));
             continue;
@@ -1298,15 +1516,17 @@ GS::ObjectState SetLayoutSettingsCommand::Execute (const GS::ObjectState& parame
         bool sizeProvided = false;
         sizeProvided |= static_cast<bool> (item.Get ("horizontalSize", dummyD));
         sizeProvided |= static_cast<bool> (item.Get ("verticalSize",   dummyD));
+        sizeProvided |= item.Contains ("leftMargin") || item.Contains ("rightMargin") || item.Contains ("topMargin") || item.Contains ("bottomMargin");
 
         if (sizeProvided && !isMasterLayout) {
             executionResults.Push (CreateFailedExecutionResult (APIERR_NOTSUPPORTED,
-                "Size can only be changed on master layouts."));
+                "Paper size and margins can only be changed on master layouts, in millimetres."));
             continue;
         }
 
         API_LayoutInfo layoutInfo = {};
         GSErrCode err = ACAPI_Navigator_GetLayoutSets (&layoutInfo, &dbInfo.databaseUnId);
+        const GS::OnExit layoutDataCleanup ([&] () { delete layoutInfo.customData; });
         if (err != NoError) {
             executionResults.Push (CreateFailedExecutionResult (err, "Failed to read current layout settings."));
             continue;
@@ -1323,6 +1543,15 @@ GS::ObjectState SetLayoutSettingsCommand::Execute (const GS::ObjectState& parame
         item.Get ("topMargin",               layoutInfo.topMargin);
         item.Get ("rightMargin",             layoutInfo.rightMargin);
         item.Get ("bottomMargin",            layoutInfo.bottomMargin);
+        if (sizeProvided) {
+            bool valid = true;
+            for (double value : {layoutInfo.sizeX, layoutInfo.sizeY, layoutInfo.leftMargin, layoutInfo.rightMargin, layoutInfo.topMargin, layoutInfo.bottomMargin})
+                valid &= std::isfinite (value) && value >= 0;
+            if (!valid || layoutInfo.sizeX <= 0 || layoutInfo.sizeY <= 0 ||
+                layoutInfo.leftMargin + layoutInfo.rightMargin >= layoutInfo.sizeX || layoutInfo.topMargin + layoutInfo.bottomMargin >= layoutInfo.sizeY) {
+                executionResults.Push (CreateFailedExecutionResult (APIERR_BADPARS, "Paper size and margins must be finite, positive and leave printable area, in millimetres.")); continue;
+            }
+        }
         SetCharProperty (&item, "customLayoutNumber", layoutInfo.customLayoutNumber);
         item.Get ("customLayoutNumbering",   layoutInfo.customLayoutNumbering);
         item.Get ("doNotIncludeInNumbering", layoutInfo.doNotIncludeInNumbering);
@@ -1336,27 +1565,50 @@ GS::ObjectState SetLayoutSettingsCommand::Execute (const GS::ObjectState& parame
 
             // Build reverse map: field name → GUID string (for name-based lookup)
             GS::HashTable<GS::UniString, GS::UniString> schemeByName;
+            GS::HashSet<GS::UniString> ambiguousNames;
+            GS::HashSet<API_Guid> schemeIds;
             for (const auto& sk : schemeByGuid) {
 #ifdef ServerMainVers_2800
-                schemeByName.Add (sk.value, sk.key);
+                const auto name = sk.value; const auto key = sk.key;
 #else
-                schemeByName.Add (*sk.value, *sk.key);
+                const auto name = *sk.value; const auto key = *sk.key;
 #endif
+                if (schemeByName.ContainsKey (name)) ambiguousNames.Add (name);
+                else schemeByName.Add (name, key);
+                schemeIds.Add (APIGuidFromString (key.ToCStr ()));
             }
 
-            delete layoutInfo.customData;
-            layoutInfo.customData = new GS::HashTable<API_Guid, GS::UniString> ();
+            GS::UniString mode = "Replace";
+            item.Get ("customDataMode", mode);
+            if (mode != "Replace" && mode != "Merge") {
+                executionResults.Push (CreateFailedExecutionResult (APIERR_BADPARS, "Unknown customDataMode.")); continue;
+            }
+            if (mode == "Replace") {
+                delete layoutInfo.customData;
+                layoutInfo.customData = nullptr;
+            }
+            if (layoutInfo.customData == nullptr) layoutInfo.customData = new GS::HashTable<API_Guid, GS::UniString> ();
+            bool fieldsValid = true;
+            GS::HashSet<API_Guid> suppliedIds;
             for (const auto& cd : customDataItems) {
                 GS::UniString keyStr, value;
                 if (!cd.Get ("customSchemeKey", keyStr)) {
                     GS::UniString nameStr;
-                    if (cd.Get ("customSchemeName", nameStr) && schemeByName.ContainsKey (nameStr)) {
+                    if (cd.Get ("customSchemeName", nameStr) && schemeByName.ContainsKey (nameStr) && !ambiguousNames.Contains (nameStr)) {
                         schemeByName.Get (nameStr, &keyStr);
                     }
                 }
-                if (!keyStr.IsEmpty () && cd.Get ("customSchemeValue", value)) {
-                    layoutInfo.customData->Put (APIGuidFromString (keyStr.ToCStr ()), value);
+                const API_Guid key = APIGuidFromString (keyStr.ToCStr ());
+                if (!keyStr.IsEmpty () && schemeIds.Contains (key) && !suppliedIds.Contains (key) && cd.Get ("customSchemeValue", value)) {
+                    suppliedIds.Add (key);
+                    layoutInfo.customData->Put (key, value);
+                } else {
+                    fieldsValid = false; break;
                 }
+            }
+            if (!fieldsValid) {
+                executionResults.Push (CreateFailedExecutionResult (APIERR_BADPARS, "Custom layout fields contain an unknown, ambiguous or duplicate key/name; no settings were changed."));
+                continue;
             }
         }
 
@@ -1369,7 +1621,10 @@ GS::ObjectState SetLayoutSettingsCommand::Execute (const GS::ObjectState& parame
         } else if (showMasterBelowProvided) {
             API_LayoutInfo verifyInfo = {};
             const GSErrCode verifyErr = ACAPI_Navigator_GetLayoutSets (&verifyInfo, &dbInfo.databaseUnId);
-            if (verifyErr == NoError && verifyInfo.showMasterBelow != showMasterBelowRequested) {
+            const GS::OnExit verifyCleanup ([&] () { delete verifyInfo.customData; });
+            if (verifyErr != NoError) {
+                executionResults.Push (CreateFailedExecutionResult (verifyErr, "Layout changed but native verification failed; inspect before retrying."));
+            } else if (verifyInfo.showMasterBelow != showMasterBelowRequested) {
                 executionResults.Push (CreateFailedExecutionResult (APIERR_NOTSUPPORTED,
                     "showMasterBelow cannot be changed for this layout type via the API."));
             } else {

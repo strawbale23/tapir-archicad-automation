@@ -281,6 +281,49 @@ GS::Optional<GS::UniString> CheckOpeningSize (const GS::ObjectState& data)
     return {};
 }
 
+// A window or a door is created together with its Main Marker sub-element, and that marker
+// lives on the floor plan: ACAPI_Element_CreateExt refuses the whole create with
+// APIERR_BADDATABASE (-2130313110) when the current database is anything else, whatever the
+// caller sent. That is what #532 turned out to be - the very same script created walls,
+// columns, slabs and openings from the 3D window without complaint and only CreateWindows /
+// CreateDoors failed, and the identical payload worked as soon as the floor plan was active.
+//
+// So switch the CURRENT DATABASE - not the visible window - to the floor plan around the
+// create, and let the caller put the previous one back. This is the same
+// ACAPI_Database_ChangeCurrentDatabase dance CreateDrawingsCommand and ChangeWindowToViewCommand
+// already do, and the note in ApplicationCommands.cpp calls the current database the one
+// "used by ACAPI element creation".
+//
+// `switched` says whether anything has to be restored: when the floor plan is already the
+// current database nothing is touched, so the path that works today stays exactly as it is.
+GSErrCode SwitchCurrentDatabaseToFloorPlan (API_DatabaseInfo& previousDatabase, bool& switched)
+{
+    switched = false;
+
+    GSErrCode err = ACAPI_Database_GetCurrentDatabase (&previousDatabase);
+    if (err != NoError) {
+        return err;
+    }
+    if (previousDatabase.typeID == APIWind_FloorPlanID) {
+        return NoError;
+    }
+
+    API_DatabaseInfo floorPlanDatabase = {};
+    floorPlanDatabase.typeID = APIWind_FloorPlanID;
+    err = ACAPI_Window_GetDatabaseInfo (&floorPlanDatabase);
+    if (err != NoError) {
+        return err;
+    }
+
+    err = ACAPI_Database_ChangeCurrentDatabase (&floorPlanDatabase);
+    if (err != NoError) {
+        return err;
+    }
+
+    switched = true;
+    return NoError;
+}
+
 GSErrCode PrepareWindowOrDoorDefaults (API_ElemTypeID elemTypeId, API_Element& element, API_ElementMemo& memo, API_SubElement& marker)
 {
     element = {};
@@ -297,6 +340,25 @@ GSErrCode PrepareWindowOrDoorDefaults (API_ElemTypeID elemTypeId, API_Element& e
         return err;
     }
 
+    // `marker.subType` was NOT asked for with `APISubElement_NoParams`, so the call above
+    // already returned the parameters of the TOOL DEFAULT marker - the window/door stamp
+    // as the template, the user or a just-applied favorite configured it. Overwriting them
+    // with the marker parent library part's factory values silently threw those settings
+    // away (#551), and leaked the handle `GetDefaultsExt` had allocated. Keep them, and
+    // leave the marker object's pen alone: `useObjPens` / `pen` are part of the very same
+    // tool default. Compare `CreateSectionsCommand`, which passes the marker straight from
+    // `GetDefaultsExt` to `CreateExt` without touching its parameters.
+    const GSSize markerParamNum = marker.memo.params != nullptr
+        ? BMGetHandleSize ((GSHandle) marker.memo.params) / sizeof (API_AddParType)
+        : 0;
+    if (markerParamNum > 0) {
+        return NoError;
+    }
+
+    // No tool default marker parameters (a project where the Window / Door tool has never
+    // been opened): fall back to the marker parent's library part, as the DevKit's own
+    // window/door creation sample does. Without parameters `ACAPI_Element_CreateExt`
+    // refuses the marker, so an unset pen is filled in here too.
     API_LibPart libPart = {};
 #ifdef ServerMainVers_2700
     err = ACAPI_LibraryPart_GetMarkerParent (element.header.type, libPart);
@@ -325,7 +387,9 @@ GSErrCode PrepareWindowOrDoorDefaults (API_ElemTypeID elemTypeId, API_Element& e
     }
 
     marker.memo.params = markAddPars;
-    marker.subElem.object.pen = 166;
+    if (marker.subElem.object.pen <= 0) {
+        marker.subElem.object.pen = 166;
+    }
     marker.subElem.object.useObjPens = true;
     return NoError;
 }
@@ -671,34 +735,20 @@ void AddSectionAssociativePoint (
     points.Push (point);
 }
 
-GS::Optional<GS::UniString> BuildSectionAssociativeDimensionPoints (
+GS::Optional<GS::UniString> AppendSectionAssociativeDimensionPoints (
     const GS::ObjectState& data,
+    SectionAssociativeDimensionPreset preset,
+    const API_Guid& sectionElementGuid,
     GS::Array<AssociativeDimensionPoint>& points,
     API_Vector& defaultDirection)
 {
-    const GS::ObjectState* sectionElementId = data.Get ("sectionElementId");
-    if (sectionElementId == nullptr) {
-        return "Missing required field 'sectionElementId'.";
-    }
-
     API_Element sectionElement = {};
     API_Element parentElement = {};
     {
-        auto error = LoadSectionElementAndParent (GetGuidFromObjectState (*sectionElementId), sectionElement, parentElement);
+        auto error = LoadSectionElementAndParent (sectionElementGuid, sectionElement, parentElement);
         if (error.HasValue ()) {
             return error;
         }
-    }
-
-    GS::UniString presetName;
-    if (!data.Get ("preset", presetName)) {
-        return "Missing required field 'preset'.";
-    }
-
-    SectionAssociativeDimensionPreset preset;
-    auto error = ParseSectionAssociativeDimensionPreset (presetName, preset);
-    if (error.HasValue ()) {
-        return error;
     }
 
     auto requireParentType = [&] (std::initializer_list<API_ElemTypeID> allowedTypes, const char* message) -> GS::Optional<GS::UniString> {
@@ -838,6 +888,52 @@ GS::Optional<GS::UniString> BuildSectionAssociativeDimensionPoints (
     return {};
 }
 
+GS::Optional<GS::UniString> BuildSectionAssociativeDimensionPoints (
+    const GS::ObjectState& data,
+    GS::Array<AssociativeDimensionPoint>& points,
+    API_Vector& defaultDirection)
+{
+    GS::Array<API_Guid> sectionElementGuids;
+    const GS::ObjectState* sectionElementId = data.Get ("sectionElementId");
+    GS::Array<GS::ObjectState> sectionElementIds;
+    const bool hasSectionElementIds = data.Get ("sectionElementIds", sectionElementIds);
+    if (sectionElementId != nullptr && hasSectionElementIds) {
+        return "Only one of 'sectionElementId' and 'sectionElementIds' can be given.";
+    }
+    if (sectionElementId != nullptr) {
+        sectionElementGuids.Push (GetGuidFromObjectState (*sectionElementId));
+    } else {
+        for (const GS::ObjectState& sectionElementIdItem : sectionElementIds) {
+            sectionElementGuids.Push (GetGuidFromObjectState (sectionElementIdItem));
+        }
+    }
+    if (sectionElementGuids.IsEmpty ()) {
+        return "Missing required field 'sectionElementId' or 'sectionElementIds'.";
+    }
+
+    GS::UniString presetName;
+    if (!data.Get ("preset", presetName)) {
+        return "Missing required field 'preset'.";
+    }
+
+    SectionAssociativeDimensionPreset preset;
+    {
+        auto error = ParseSectionAssociativeDimensionPreset (presetName, preset);
+        if (error.HasValue ()) {
+            return error;
+        }
+    }
+
+    for (const API_Guid& sectionElementGuid : sectionElementGuids) {
+        auto error = AppendSectionAssociativeDimensionPoints (data, preset, sectionElementGuid, points, defaultDirection);
+        if (error.HasValue ()) {
+            return error;
+        }
+    }
+
+    return {};
+}
+
 GS::ObjectState CreateElementListResponse (const GS::Array<GS::ObjectState>& elementResults)
 {
     GS::ObjectState response;
@@ -909,6 +1005,11 @@ GS::Optional<GS::UniString> BuildSlabMemoFromGeometry (
 
     if (IsSame2DCoordinate (polygonOutline.GetFirst (), polygonOutline.GetLast ())) {
         polygonOutline.Pop ();
+    }
+
+    auto holesError = ValidateHoles (holes);
+    if (holesError.HasValue ()) {
+        return holesError;
     }
 
     const API_Polygon oldPoly = element.slab.poly;
@@ -1097,6 +1198,12 @@ static GS::Optional<GS::UniString> ApplySlabPolygonChange (
     }
     if (memo.coords == nullptr || memo.pends == nullptr) {
         return "Slab has no polygon data to modify.";
+    }
+    // Validate before Step 1 below deletes the existing holes - a mis-shaped hole entry must fail
+    // the item instead of being skipped after the original holes are already gone.
+    auto holesError = ValidateHoles (holes);
+    if (holesError.HasValue ()) {
+        return holesError;
     }
 
     // A from-scratch memo rebuild (matching CreateSlabs, and BuildMeshPolyMemoFromGeometry's own
@@ -1298,6 +1405,11 @@ GS::Optional<GS::UniString> BuildRoofMemoFromGeometry (
     }
     if (polygonOutline.GetSize () < 3) return "Roof needs at least three unique contour vertices.";
 
+    auto holesError = ValidateHoles (holes);
+    if (holesError.HasValue ()) {
+        return holesError;
+    }
+
     element.roof.u.polyRoof.pivotPolygon.nCoords = polygonOutline.GetSize () + 1;
     element.roof.u.polyRoof.pivotPolygon.nSubPolys = 1;
     element.roof.u.polyRoof.pivotPolygon.nArcs = polygonArcs.GetSize ();
@@ -1372,6 +1484,11 @@ GS::Optional<GS::UniString> BuildPlaneRoofMemoFromGeometry (
         polygonOutline.Pop ();
     }
     if (polygonOutline.GetSize () < 3) return "Roof needs at least three unique contour vertices.";
+
+    auto holesError = ValidateHoles (holes);
+    if (holesError.HasValue ()) {
+        return holesError;
+    }
 
     element.roof.u.planeRoof.poly.nCoords = polygonOutline.GetSize () + 1;
     element.roof.u.planeRoof.poly.nSubPolys = 1;
@@ -3196,6 +3313,18 @@ bool ApplyWindowOrDoorDetails (API_Element& element, API_Element& mask, const GS
         ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, openingBase.oSide);
         changed = true;
     }
+    bool reveal = false;
+    if (details.Get ("reveal", reveal)) {
+        element.window.reveal = reveal;
+        ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, reveal);
+        changed = true;
+    }
+    auto revealDepthOffset = GetOptionalDouble (details, "revealDepthOffset");
+    if (revealDepthOffset.HasValue ()) {
+        element.window.revealDepthOffset = revealDepthOffset.Get ();
+        ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, revealDepthOffset);
+        changed = true;
+    }
     return changed;
 }
 
@@ -3913,6 +4042,10 @@ GS::Optional<GS::UniString> CreateStairsCommand::GetInputParametersSchema () con
                             "type": "number",
                             "description": "Depth (going) of each tread.",
                             "exclusiveMinimum": 0.0
+                        },
+                        "finishVisible": {
+                            "type": "boolean",
+                            "description": "Optional. If false, the tread/riser finishes are hidden and only the stair structure (e.g. a monolith) is modeled."
                         }
                     },
                     "additionalProperties": false,
@@ -3937,6 +4070,16 @@ GS::Optional<GS::ObjectState> CreateStairsCommand::SetTypeSpecificParameters (AP
     parameters.Get ("zCoordinate", zCoordinate);
     const auto floorIndexAndOffset = ResolveFloorIndexAndOffset (parameters, "floorIndex", zCoordinate, stories);
     element.header.floorInd = floorIndexAndOffset.first;
+    element.stair.basePlane.basePoint.z = floorIndexAndOffset.second;
+
+    bool finishVisible = true;
+    if (parameters.Get ("finishVisible", finishVisible)) {
+        element.stair.finishVisible = finishVisible;
+        for (int role = 0; role < API_StairPartRoleNum; ++role) {
+            element.stair.tread[role].visible = finishVisible;
+            element.stair.riser[role].visible = finishVisible;
+        }
+    }
 
     auto totalHeight = GetOptionalDouble (parameters, "totalHeight");
     if (totalHeight.HasValue ()) {
@@ -4131,6 +4274,22 @@ GS::ObjectState CreateWindowsCommand::Execute (const GS::ObjectState& parameters
         return CreateErrorResponse (APIERR_BADPARS, error.Get ());
     }
 
+    // The create needs the floor plan as the current database - see
+    // SwitchCurrentDatabaseToFloorPlan. The previous database is restored after the
+    // undoable command has finished, on every exit path.
+    API_DatabaseInfo previousDatabase = {};
+    bool databaseSwitched = false;
+    const GSErrCode databaseErr = SwitchCurrentDatabaseToFloorPlan (previousDatabase, databaseSwitched);
+    const GS::OnExit restoreDatabase ([&]() {
+        if (databaseSwitched) {
+            ACAPI_Database_ChangeCurrentDatabase (&previousDatabase);
+        }
+    });
+    if (databaseErr != NoError) {
+        return CreateErrorResponse (databaseErr,
+            "Failed to activate the floor plan database, which is needed to create a window. Activate the floor plan in Archicad and run the command again.");
+    }
+
     return ExecuteCreateWithElements ("Create Windows", [&](GS::Array<GS::ObjectState>& elements) {
         for (const auto& data : windowsData) {
             if (data.Get ("ownerWallId") == nullptr) {
@@ -4220,7 +4379,14 @@ GS::ObjectState CreateWindowsCommand::Execute (const GS::ObjectState& parameters
 
             err = ACAPI_Element_CreateExt (&element, &memo, 1UL, &marker);
             if (err != NoError) {
-                elements.Push (CreateErrorResponse (err, "Failed to create window."));
+                // The switch above should have ruled this one out, but say what it means
+                // if Archicad still refuses the database - #532 was reported for a year as
+                // a parameter problem because the message named none of this.
+                GS::UniString errorMessage = "Failed to create window.";
+                if (err == APIERR_BADDATABASE) {
+                    errorMessage = "Failed to create window: Archicad refused the current database. A window can only be created while the floor plan is the current database.";
+                }
+                elements.Push (CreateErrorResponse (err, errorMessage));
                 continue;
             }
             elements.Push (CreateElementIdObjectState (element.header.guid));
@@ -4308,6 +4474,22 @@ GS::ObjectState CreateDoorsCommand::Execute (const GS::ObjectState& parameters, 
     auto error = GetElementArray (parameters, "doorsData", doorsData);
     if (error.HasValue ()) {
         return CreateErrorResponse (APIERR_BADPARS, error.Get ());
+    }
+
+    // The create needs the floor plan as the current database - see
+    // SwitchCurrentDatabaseToFloorPlan. The previous database is restored after the
+    // undoable command has finished, on every exit path.
+    API_DatabaseInfo previousDatabase = {};
+    bool databaseSwitched = false;
+    const GSErrCode databaseErr = SwitchCurrentDatabaseToFloorPlan (previousDatabase, databaseSwitched);
+    const GS::OnExit restoreDatabase ([&]() {
+        if (databaseSwitched) {
+            ACAPI_Database_ChangeCurrentDatabase (&previousDatabase);
+        }
+    });
+    if (databaseErr != NoError) {
+        return CreateErrorResponse (databaseErr,
+            "Failed to activate the floor plan database, which is needed to create a door. Activate the floor plan in Archicad and run the command again.");
     }
 
     return ExecuteCreateWithElements ("Create Doors", [&](GS::Array<GS::ObjectState>& elements) {
@@ -4399,7 +4581,12 @@ GS::ObjectState CreateDoorsCommand::Execute (const GS::ObjectState& parameters, 
 
             err = ACAPI_Element_CreateExt (&element, &memo, 1UL, &marker);
             if (err != NoError) {
-                elements.Push (CreateErrorResponse (err, "Failed to create door."));
+                // See the same spot in CreateWindowsCommand::Execute.
+                GS::UniString errorMessage = "Failed to create door.";
+                if (err == APIERR_BADDATABASE) {
+                    errorMessage = "Failed to create door: Archicad refused the current database. A door can only be created while the floor plan is the current database.";
+                }
+                elements.Push (CreateErrorResponse (err, errorMessage));
                 continue;
             }
             elements.Push (CreateElementIdObjectState (element.header.guid));
@@ -5243,7 +5430,16 @@ GS::Optional<GS::UniString> CreateAssociativeDimensionsOnSectionCommand::GetInpu
                 "items": {
                     "type": "object",
                     "properties": {
-                        "sectionElementId": { "$ref": "#/ElementId" },
+                        "sectionElementId": {
+                            "$ref": "#/ElementId",
+                            "description": "The identifier of a single section element. Only one of sectionElementId and sectionElementIds can be given."
+                        },
+                        "sectionElementIds": {
+                            "type": "array",
+                            "items": { "$ref": "#/ElementId" },
+                            "minItems": 1,
+                            "description": "A list of section elements whose preset points are merged into one continuous dimension chain. Only one of sectionElementId and sectionElementIds can be given."
+                        },
                         "referencePoint": { "$ref": "#/Coordinate2D" },
                         "preset": {
                             "type": "string",
@@ -5269,7 +5465,7 @@ GS::Optional<GS::UniString> CreateAssociativeDimensionsOnSectionCommand::GetInpu
                         "placeOnTop": { "type": "boolean" }
                     },
                     "additionalProperties": false,
-                    "required": ["sectionElementId", "referencePoint", "preset"]
+                    "required": ["referencePoint", "preset"]
                 }
             }
         },
@@ -5943,7 +6139,8 @@ GS::Optional<GS::UniString> ModifySlabsCommand::GetInputParametersSchema () cons
                         "polygonOutline": {
                             "type": "array",
                             "items": { "$ref": "#/Coordinate2D" },
-                            "minItems": 3
+                            "minItems": 3,
+                            "description": "Replaces the slab's entire polygon, including its holes - resend the holes field too to keep them, otherwise they are removed."
                         },
                         "polygonArcs": {
                             "type": "array",
@@ -6562,7 +6759,9 @@ GS::Optional<GS::UniString> ModifyWindowsCommand::GetInputParametersSchema () co
                         "centerOffset": { "type": "number", "minimum": 0.0 },
                         "reflected": { "type": "boolean" },
                         "refSide": { "type": "boolean" },
-                        "oSide": { "type": "boolean" }
+                        "oSide": { "type": "boolean" },
+                        "reveal": { "type": "boolean", "description": "Turn the reveal on or off." },
+                        "revealDepthOffset": { "type": "number", "description": "Distance the frame plane is moved across the wall thickness, along the wall normal." }
                     },
                     "additionalProperties": false,
                     "required": ["elementId"],
@@ -6700,7 +6899,9 @@ GS::Optional<GS::UniString> ModifyDoorsCommand::GetInputParametersSchema () cons
                         "centerOffset": { "type": "number", "minimum": 0.0 },
                         "reflected": { "type": "boolean" },
                         "refSide": { "type": "boolean" },
-                        "oSide": { "type": "boolean" }
+                        "oSide": { "type": "boolean" },
+                        "reveal": { "type": "boolean", "description": "Turn the reveal on or off." },
+                        "revealDepthOffset": { "type": "number", "description": "Distance the frame plane is moved across the wall thickness, along the wall normal." }
                     },
                     "additionalProperties": false,
                     "required": ["elementId"],
@@ -7405,6 +7606,11 @@ GS::Optional<GS::UniString> BuildMeshPolyMemoFromGeometry (
     }
     if (IsSame2DCoordinate (polygonCoordinates.GetFirst (), polygonCoordinates.GetLast ())) {
         polygonCoordinates.Pop ();
+    }
+
+    auto holesError = ValidateHoles (holes);
+    if (holesError.HasValue ()) {
+        return holesError;
     }
 
     elem.mesh.poly.nCoords   = polygonCoordinates.GetSize () + 1;

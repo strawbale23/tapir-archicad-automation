@@ -1,25 +1,6 @@
 #pragma once
 #include "CommandBase.hpp"
 
-class ModifyTextsCommand : public CommandBase
-{
-public:
-    ModifyTextsCommand () : CommandBase (CommonSchema::Used) {}
-    GS::String GetName () const override { return "ModifyTexts"; }
-    GS::Optional<GS::UniString> GetInputParametersSchema () const override;
-    GS::Optional<GS::UniString> GetRawResponseSchema () const override;
-    GS::ObjectState Execute (const GS::ObjectState&, GS::ProcessControl&) const override;
-};
-class ModifyLabelsCommand : public CommandBase
-{
-public:
-    ModifyLabelsCommand () : CommandBase (CommonSchema::Used) {}
-    GS::String GetName () const override { return "ModifyLabels"; }
-    GS::Optional<GS::UniString> GetInputParametersSchema () const override;
-    GS::Optional<GS::UniString> GetRawResponseSchema () const override;
-    GS::ObjectState Execute (const GS::ObjectState&, GS::ProcessControl&) const override;
-};
-
 class GetAnnotationDetailsCommand : public CommandBase
 {
 public:

@@ -46,6 +46,8 @@ private:
 
 GS::ObjectState CreateErrorResponse (GSErrCode errorCode, const GS::UniString& errorMessage);
 GS::ObjectState CreateFailedExecutionResult (GSErrCode errorCode, const GS::UniString& errorMessage);
+// The FailedExecutionResult shape for an error already built with CreateErrorResponse.
+GS::ObjectState CreateFailedExecutionResult (const GS::ObjectState& errorResponse);
 GS::ObjectState CreateSuccessfulExecutionResult ();
 
 // Appends an actionable explanation for the handful of common, recognizable reasons an
@@ -93,6 +95,15 @@ inline GS::ObjectState CreateAttributeIdObjectState (const API_Guid& guid) { ret
 inline GS::ObjectState CreateIssueIdObjectState (const API_Guid& guid)     { return CreateIdObjectState ("issueId", guid); }
 inline GS::ObjectState CreateDatabaseIdObjectState (const API_Guid& guid)  { return CreateIdObjectState ("databaseId", guid); }
 
+// A hotlink instance is placed by an API_Tranmat. Every caller of this add-on
+// thinks in an origin, a rotation and a mirror flag, so the two directions of
+// that conversion live here, shared by the hotlink commands and by
+// GetDetailsOfElements. Mirroring reflects the module's local X axis before
+// the rotation is applied; a reflection is an orthogonal matrix, which is what
+// Archicad expects.
+API_Tranmat CreateHotlinkTransformation (const API_Coord3D& origin, double rotationAngle, bool mirrored);
+void        DecomposeHotlinkTransformation (const API_Tranmat& transformation, API_Coord3D& origin, double& rotationAngle, bool& mirrored);
+
 struct PolygonData {
     std::vector<API_Coord>   coords;
     std::vector<API_PolyArc> arcs;
@@ -102,6 +113,7 @@ std::vector<PolygonData> GetPolygonsFromMemoCoords (const API_Guid& elemGuid, bo
 void AddPolygonFromMemoCoords (const API_Guid& elemGuid, GS::ObjectState& os, const GS::String& coordsFieldName, const GS::Optional<GS::String>& arcsFieldName = {});
 void AddPolygonWithHolesFromMemoCoords (const API_Guid& elemGuid, GS::ObjectState& os, const GS::String& coordsFieldName, const GS::Optional<GS::String>& arcsFieldName, const GS::String& holesArrayFieldName, const GS::String& holeCoordsFieldName, const GS::Optional<GS::String>& holeArcsFieldName, bool includeZCoords = false);
 bool GetHoleGeometry (const GS::ObjectState& holeOs, GS::Array<GS::ObjectState>& outCoords, GS::Array<GS::ObjectState>& outArcs);
+GS::Optional<GS::UniString> ValidateHoles (const GS::Array<GS::ObjectState>& holes);
 void AddBeamHolesFromMemo (const API_Guid& elemGuid, GS::ObjectState& os, const GS::String& holesFieldName);
 void AddColumnSectionFromMemo (const API_Guid& elemGuid, GS::ObjectState& os);
 void AddBeamSectionFromMemo (const API_Guid& elemGuid, GS::ObjectState& os);
@@ -130,6 +142,8 @@ GS::UniString HatchOrientationTypeToString (API_HatchOrientationTypeID type);
 API_HatchOrientationTypeID HatchOrientationTypeFromString (const GS::UniString& str, API_HatchOrientationTypeID defaultValue = API_HatchGlobal);
 GS::ObjectState CreateHatchOrientationObjectState (const API_HatchOrientation& orientation);
 API_HatchOrientation GetHatchOrientationFromObjectState (const GS::ObjectState& os);
+GS::UniString DrawingNameTypeToString (API_NameTypeValues nameType);
+API_NameTypeValues DrawingNameTypeFromString (const GS::UniString& str, API_NameTypeValues defaultValue = APIName_ViewOrSrcFileName);
 
 // Defined in ExtendedElementCommands.cpp (not ElementCommands.cpp, where it's called from) -
 // reading a Morph's body needs Model3D/MeshBody.hpp, which cannot be included in the same

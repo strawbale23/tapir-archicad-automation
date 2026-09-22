@@ -92,116 +92,6 @@ GS::ObjectState EditDimensionChainCommand::Execute (const GS::ObjectState& param
     return response;
 }
 
-GS::Optional<GS::UniString> ModifyTextsCommand::GetInputParametersSchema () const
-{
-    return R"({"type":"object","properties":{"textsWithDetails":{"type":"array","minItems":1,"maxItems":100,"items":{
-        "type":"object","properties":{
-            "elementId":{"$ref":"#/ElementId"},"text":{"type":"string","maxLength":1000000},
-            "coordinate":{"$ref":"#/Coordinate2D"},"angle":{"type":"number","description":"Radians."},
-            "widthMillimetres":{"type":"number","exclusiveMinimum":0,"description":"Native text block width in millimetres."},
-            "nonBreaking":{"type":"boolean","description":"True disables automatic wrapping."}
-        },"required":["elementId"],"minProperties":2,"additionalProperties":false
-    }}},"required":["textsWithDetails"],"additionalProperties":false})";
-}
-
-GS::Optional<GS::UniString> ModifyLabelsCommand::GetInputParametersSchema () const
-{
-    return R"({"type":"object","properties":{"labelsWithDetails":{"type":"array","minItems":1,"maxItems":100,"items":{
-        "type":"object","properties":{
-            "elementId":{"$ref":"#/ElementId"},"text":{"type":"string","maxLength":1000000,"description":"Only native text labels; symbolic labels use GDL parameters."},
-            "begCoordinate":{"$ref":"#/Coordinate2D"},"midCoordinate":{"$ref":"#/Coordinate2D"},
-            "endCoordinate":{"$ref":"#/Coordinate2D"},"hasLeaderLine":{"type":"boolean"}
-        },"required":["elementId"],"minProperties":2,"additionalProperties":false
-    }}},"required":["labelsWithDetails"],"additionalProperties":false})";
-}
-
-GS::Optional<GS::UniString> ModifyTextsCommand::GetRawResponseSchema () const
-{
-    return R"({"type":"object","properties":{"executionResults":{"$ref":"#/ExecutionResults"}},"required":["executionResults"],"additionalProperties":false})";
-}
-
-GS::Optional<GS::UniString> ModifyLabelsCommand::GetRawResponseSchema () const
-{
-    return ModifyTextsCommand ().GetRawResponseSchema ();
-}
-
-static GS::ObjectState ModifyAnnotations (const GS::ObjectState& parameters, bool labels)
-{
-    GS::Array<GS::ObjectState> items;
-    parameters.Get (labels ? "labelsWithDetails" : "textsWithDetails", items);
-    if (items.IsEmpty () || items.GetSize () > 100)
-        return CreateErrorResponse (APIERR_BADPARS, "Supply 1 to 100 annotations.");
-    GS::ObjectState response;
-    const auto& add = response.AddList<GS::ObjectState> ("executionResults");
-    const GSErrCode transaction = ACAPI_CallUndoableCommand ("Modify Annotations", [&] () -> GSErrCode {
-        for (const auto& item : items) {
-            API_Element element = {}, mask;
-            element.header.guid = GetGuidFromArrayItem ("elementId", item);
-            GSErrCode err = ACAPI_Element_Get (&element);
-            if (err != NoError) { add (CreateFailedExecutionResult (err, "Cannot read annotation.")); continue; }
-            if (GetElemTypeId (element.header) != (labels ? API_LabelID : API_TextID)) {
-                add (CreateFailedExecutionResult (APIERR_BADPARS, "The element is not the requested annotation type.")); continue;
-            }
-            GS::UniString text;
-            const bool replaceText = item.Get ("text", text);
-            if (labels && replaceText && element.label.labelClass != APILblClass_Text) {
-                add (CreateFailedExecutionResult (APIERR_BADPARS, "Symbolic label text must be changed through its supported GDL parameters.")); continue;
-            }
-            ACAPI_ELEMENT_MASK_CLEAR (mask);
-            API_ElementMemo memo = {};
-            const GS::OnExit dispose ([&] () { ACAPI_DisposeElemMemoHdls (&memo); });
-            bool changed = replaceText;
-            if (replaceText) {
-#ifdef ServerMainVers_2800
-                memo.textContent = new GS::UniString (text);
-#else
-                memo.textContent = BMhAllClear ((text.GetLength () + 1) * sizeof (GS::uchar_t));
-                if (memo.textContent == nullptr) { add (CreateFailedExecutionResult (APIERR_MEMFULL, "Cannot allocate text.")); continue; }
-                GS::ucscpy (reinterpret_cast<GS::uchar_t*> (*memo.textContent), text.ToUStr ());
-#endif
-            }
-            if (!labels) {
-                if (const auto* coordinate = item.Get ("coordinate")) {
-                    element.text.loc = Get2DCoordinateFromObjectState (*coordinate);
-                    ACAPI_ELEMENT_MASK_SET (mask, API_TextType, loc); changed = true;
-                }
-                if (item.Get ("angle", element.text.angle)) { ACAPI_ELEMENT_MASK_SET (mask, API_TextType, angle); changed = true; }
-                if (item.Get ("widthMillimetres", element.text.width)) { ACAPI_ELEMENT_MASK_SET (mask, API_TextType, width); changed = true; }
-                if (item.Get ("nonBreaking", element.text.nonBreaking)) { ACAPI_ELEMENT_MASK_SET (mask, API_TextType, nonBreaking); changed = true; }
-            } else {
-                if (const auto* coordinate = item.Get ("begCoordinate")) {
-                    element.label.begC = Get2DCoordinateFromObjectState (*coordinate);
-                    ACAPI_ELEMENT_MASK_SET (mask, API_LabelType, begC); changed = true;
-                }
-                if (const auto* coordinate = item.Get ("midCoordinate")) {
-                    element.label.midC = Get2DCoordinateFromObjectState (*coordinate);
-                    ACAPI_ELEMENT_MASK_SET (mask, API_LabelType, midC); changed = true;
-                }
-                if (const auto* coordinate = item.Get ("endCoordinate")) {
-                    element.label.endC = Get2DCoordinateFromObjectState (*coordinate);
-                    ACAPI_ELEMENT_MASK_SET (mask, API_LabelType, endC); changed = true;
-                }
-                if (item.Get ("hasLeaderLine", element.label.hasLeaderLine)) { ACAPI_ELEMENT_MASK_SET (mask, API_LabelType, hasLeaderLine); changed = true; }
-            }
-            if (!changed) { add (CreateFailedExecutionResult (APIERR_BADPARS, "No annotation changes supplied.")); continue; }
-            err = ACAPI_Element_Change (&element, &mask, replaceText ? &memo : nullptr, replaceText ? APIMemoMask_TextContent : 0, true);
-            add (err == NoError ? CreateSuccessfulExecutionResult () : CreateFailedExecutionResult (err, "Native annotation edit failed."));
-        }
-        return NoError;
-    });
-    if (transaction != NoError) return CreateErrorResponse (transaction, "Annotation transaction failed; committed state is not confirmed.");
-    return response;
-}
-
-GS::ObjectState ModifyTextsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const
-{
-    return ModifyAnnotations (parameters, false);
-}
-GS::ObjectState ModifyLabelsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const
-{
-    return ModifyAnnotations (parameters, true);
-}
-
 GS::Optional<GS::UniString> GetAnnotationDetailsCommand::GetInputParametersSchema () const
 {
     return R"({"type":"object","properties":{"elements":{"type":"array","minItems":1,"maxItems":100,"items":{
@@ -304,7 +194,7 @@ GS::Optional<GS::UniString> ModifyDimensionSettingsCommand::GetInputParametersSc
 }
 GS::Optional<GS::UniString> ModifyDimensionSettingsCommand::GetRawResponseSchema () const
 {
-    return ModifyTextsCommand ().GetRawResponseSchema ();
+    return R"({"type":"object","properties":{"executionResults":{"$ref":"#/ExecutionResults"}},"required":["executionResults"],"additionalProperties":false})";
 }
 GS::ObjectState ModifyDimensionSettingsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const
 {
@@ -366,7 +256,7 @@ GS::Optional<GS::UniString> SetAnnotationTextStyleCommand::GetInputParametersSch
 }
 GS::Optional<GS::UniString> SetAnnotationTextStyleCommand::GetRawResponseSchema () const
 {
-    return ModifyTextsCommand ().GetRawResponseSchema ();
+    return R"({"type":"object","properties":{"executionResults":{"$ref":"#/ExecutionResults"}},"required":["executionResults"],"additionalProperties":false})";
 }
 GS::ObjectState SetAnnotationTextStyleCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const
 {

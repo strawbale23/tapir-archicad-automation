@@ -197,6 +197,10 @@ GSErrCode Initialize (void)
             applicationCommands, "0.1.0",
             "Performs a quit operation on the currently running Archicad instance."
         );
+        err |= RegisterCommand<GetPointFromUserCommand> (
+            applicationCommands, "1.5.9",
+            "Asks the designer to click a point in the current window and returns it. Archicad waits for the click or for Escape, and every other JSON command queues behind this one until then; the call fails when the input is cancelled."
+        );
         err |= RegisterCommand<GetCurrentWindowTypeCommand> (
             applicationCommands, "1.0.7",
             "Returns the type of the current (active) window."
@@ -251,9 +255,29 @@ GSErrCode Initialize (void)
             projectCommands, "1.1.5",
             "Sets the story sructure of the currently loaded project."
         );
+        err |= RegisterCommand<GetAutoTextKeysCommand> (
+            projectCommands, "1.5.9",
+            "Retrieves the available autotext keys (name and embeddable key), optionally for a specific element. Embed a key in a Text or Label content by surrounding it with '<' and '>'."
+        );
+        err |= RegisterCommand<GetAutoTextNameCommand> (
+            projectCommands, "1.5.9",
+            "Retrieves the display names of one or more autotext keys (as returned inside a '<...>' embedded key), with a direct guid lookup for property-based keys instead of enumerating every property definition."
+        );
         err |= RegisterCommand<GetHotlinksCommand> (
             projectCommands, "0.1.0",
             "Gets the file system locations (path) of the hotlink modules. The hotlinks can have tree hierarchy in the project."
+        );
+        err |= RegisterCommand<CreateHotlinkNodesCommand> (
+            projectCommands, "1.5.9",
+            "Creates hotlink module nodes from source files. A node that already points at the same file is returned instead of duplicated (Archicad 26 and later; 25 cannot see an unplaced node)."
+        );
+        err |= RegisterCommand<CreateHotlinkInstancesCommand> (
+            projectCommands, "1.5.9",
+            "Places instances of hotlink module nodes at an origin, rotation and mirroring."
+        );
+        err |= RegisterCommand<ChangeHotlinkInstancesCommand> (
+            projectCommands, "1.5.9",
+            "Moves, rotates or mirrors placed hotlink instances by changing their transformation. MoveElements and RotateElements do not work on hotlink instances."
         );
         err |= RegisterCommand<OpenProjectCommand> (
             projectCommands, "1.0.7",
@@ -266,6 +290,14 @@ GSErrCode Initialize (void)
         err |= RegisterCommand<SaveProjectCommand> (
             projectCommands, "1.3.1",
             "Saves the currently opened project."
+        );
+        err |= RegisterCommand<SaveAsModuleFileCommand> (
+            projectCommands, "1.5.9",
+            "Saves the given elements, or the current selection, as a hotlink module (.mod) file."
+        );
+        err |= RegisterCommand<SaveProjectAsArchiveCommand> (
+            projectCommands, "1.5.10",
+            "Saves the open project as an archive (.pla) file, with the library parts it uses inside."
         );
         err |= RegisterCommand<GetCalculationUnitsCommand> (
             projectCommands, "1.4.0",
@@ -437,7 +469,7 @@ GSErrCode Initialize (void)
         );
         err |= RegisterCommand<GetZoneBoundariesCommand> (
             elementCommands, "1.2.3",
-            "Gets the boundaries of the given Zone (connected elements, neighbour zones, etc.)."
+            "Gets the boundaries of the given Zones (connected elements, neighbour zones, etc.). Accepts either a single zoneElementId or a list of zones. Prefer the list: the expensive boundary recalculation runs once per call, so querying many Zones in one call is much faster than calling the command once per Zone."
         );
         err |= RegisterCommand<UpdateZonesCommand> (
             elementCommands, "1.5.4",
@@ -531,7 +563,7 @@ GSErrCode Initialize (void)
         );
         err |= RegisterCommand<CreateAssociativeDimensionsOnSectionCommand> (
             elementCommands, "1.4.0",
-            "Creates associative linear dimensions on section elements using common wall, slab, beam, column and opening presets."
+            "Creates associative linear dimensions on section elements using common wall, slab, beam, column and opening presets. The preset points of multiple section elements can be merged into one continuous dimension chain via sectionElementIds."
         );
         err |= RegisterCommand<CreateWallThicknessDimensionsCommand> (
             elementCommands, "1.4.0",
@@ -602,12 +634,12 @@ GSErrCode Initialize (void)
         err |= RegisterCommand<SetAnnotationTextStyleCommand> (
             elementCommands, "1.5.8-ai.3", "Apply selected style fields uniformly to text and text-label paragraphs while retaining content and unedited formatting.");
         err |= RegisterCommand<ModifyTextsCommand> (
-            elementCommands, "1.5.8-ai.3",
-            "Edits native text contents, position, rotation and wrapping in place. Uses Archicad text editing; does not replace the element."
+            elementCommands, "1.5.9",
+            "Modifies standalone Text elements based on the given parameters."
         );
         err |= RegisterCommand<ModifyLabelsCommand> (
-            elementCommands, "1.5.8-ai.3",
-            "Edits native text-label contents and label leader geometry in place; symbolic label content requires GDL parameter operations."
+            elementCommands, "1.5.9",
+            "Modifies Label elements based on the given parameters."
         );
         err |= RegisterCommand<CreateTextsCommand> (
             elementCommands, "1.5.0",
@@ -731,7 +763,9 @@ GSErrCode Initialize (void)
             favoritesCommands, "1.5.4",
             "Apply the given favorites to existing elements. Only settings-type parameters are changed - "
             "geometry (position, floor, and dimensions such as a Wall's height) is left untouched, so applying "
-            "a Favorite never moves or resizes the target element. By default settings, classifications, "
+            "a Favorite never moves or resizes the target element. For the hierarchical types (Stair, "
+            "Railing, Curtain Wall) the settings of the sub-elements are not applied, because they are "
+            "inseparable from the Favorite's own geometry. By default settings, classifications, "
             "categories and properties are all applied; each can be opted out of individually."
         );
         err |= RegisterCommand<UpdateFavoritesFromElementsCommand> (
@@ -789,7 +823,7 @@ GSErrCode Initialize (void)
         );
         err |= RegisterCommand<UpdatePropertyDefinitionsCommand> (
             propertyCommands, "1.5.4",
-            "Edits custom property names, descriptions, classification availability, editability and typed or expression defaults in place."
+            "Edits custom property names, descriptions, classification availability, editability and typed or expression defaults in place. Also adds enum values to an enumeration property, keeping existing values' identifiers so element values assigned to them survive."
         );
         AddCommandGroup (propertyCommands);
     }
@@ -933,7 +967,11 @@ GSErrCode Initialize (void)
         CommandGroup ifcCommands ("IFC Commands");
         err |= RegisterCommand<IFCFileOperationCommand> (
             ifcCommands, "1.2.6",
-            "Executes an IFC file operation."
+            "Executes an IFC file operation: opens or merges an IFC file, or saves the project as an IFC file. A save can name the export translator to use."
+        );
+        err |= RegisterCommand<GetIFCExportTranslatorsCommand> (
+            ifcCommands, "1.5.10",
+            "Lists the IFC export translators of the project, the preview translator first. Pass one of the names to IFCFileOperation as translatorName."
         );
         err |= RegisterCommand<GetElementsByIFCIdsCommand> (
             ifcCommands, "1.5.1",
@@ -967,6 +1005,14 @@ GSErrCode Initialize (void)
         err |= RegisterCommand<AddFilesToEmbeddedLibraryCommand> (
             libraryCommands, "1.2.2",
             "Adds the given files into the embedded library."
+        );
+        err |= RegisterCommand<SetLibrariesCommand> (
+            libraryCommands, "1.5.9",
+            "Makes the given folders the project's local libraries; built-in, embedded, server and web libraries are kept. Set the libraries before opening a file that needs them and the missing-library dialog does not appear."
+        );
+        err |= RegisterCommand<AddLibrariesCommand> (
+            libraryCommands, "1.5.9",
+            "Adds the given folders to the project's local libraries, skipping any already loaded."
         );
         err |= RegisterCommand<CheckLibraryPartAncestryCommand> (
             libraryCommands, "1.5.8-ai.3", "Check native ancestry between two identified loaded library parts. Ancestry does not prove host placement compatibility.");
@@ -1345,6 +1391,18 @@ GSErrCode Initialize (void)
         err |= RegisterCommand<GetSolidElementLinksCommand> (
             solidElementOperationCommands, "1.5.4",
             "Returns solid element operation links for each queried element, grouped by role (target or operator)."
+        );
+        err |= RegisterCommand<TrimElementsCommand> (
+            solidElementOperationCommands, "1.5.9",
+            "Trims construction elements with a roof or shell: the roofs and shells in the list, or one given trimming element with a trim type."
+        );
+        err |= RegisterCommand<RemoveElementTrimsCommand> (
+            solidElementOperationCommands, "1.5.9",
+            "Removes the trim between an element and the roof or shell trimming it."
+        );
+        err |= RegisterCommand<GetElementTrimsCommand> (
+            solidElementOperationCommands, "1.5.9",
+            "Which roofs and shells trim each queried element, with the trim type, and which elements it trims."
         );
         AddCommandGroup (solidElementOperationCommands);
     }

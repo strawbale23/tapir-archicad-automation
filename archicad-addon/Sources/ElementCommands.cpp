@@ -101,25 +101,6 @@ static API_ElemFilterFlags ConvertFilterStringToFlag (const GS::UniString& filte
     return APIFilt_None;
 }
 
-static GS::UniString DrawingNameTypeToString (API_NameTypeValues nameType)
-{
-    switch (nameType) {
-        case APIName_ViewIdAndName:  return "ViewIdAndName";
-        case APIName_CustomName:     return "CustomName";
-        default:
-        case APIName_ViewOrSrcFileName: return "ViewOrSourceFileName";
-    }
-}
-
-static API_NameTypeValues DrawingNameTypeFromString (const GS::UniString& str)
-{
-    if (str == "ViewIdAndName")
-        return APIName_ViewIdAndName;
-    if (str == "CustomName")
-        return APIName_CustomName;
-    return APIName_ViewOrSrcFileName;
-}
-
 static GS::UniString DrawingNumberingTypeToString (API_NumberingTypeValues numberingType)
 {
     switch (numberingType) {
@@ -3138,12 +3119,16 @@ GS::Optional<GS::UniString> GetZoneBoundariesCommand::GetInputParametersSchema (
         "type": "object",
         "properties": {
             "zoneElementId": {
-                "$ref": "#/ElementId"
+                "$ref": "#/ElementId",
+                "description": "The identifier of a single Zone. Prefer the zones array: querying many Zones in one call is much faster than one call per Zone."
+            },
+            "zones": {
+                "$ref": "#/Elements",
+                "description": "A list of Zones. Only one of zoneElementId and zones can be given."
             }
         },
         "additionalProperties": false,
         "required": [
-            "zoneElementId"
         ]
     })";
 }
@@ -3151,46 +3136,30 @@ GS::Optional<GS::UniString> GetZoneBoundariesCommand::GetInputParametersSchema (
 GS::Optional<GS::UniString> GetZoneBoundariesCommand::GetRawResponseSchema () const
 {
     return R"({
-        "$ref": "#/ZoneBoundariesOrError"
+        "type": "object",
+        "oneOf": [
+            {
+                "$ref": "#/ZoneBoundariesOrError"
+            },
+            {
+                "$ref": "#/ZoneBoundariesOfZonesWrapper"
+            }
+        ]
     })";
 }
 
-GS::ObjectState GetZoneBoundariesCommand::Execute (
-    const GS::ObjectState& parameters,
 #ifdef ServerMainVers_2800
-    GS::ProcessControl& processControl) const
-#else
-    GS::ProcessControl& /*processControl*/) const
-#endif
+
+static GS::ObjectState GetBoundariesOfZone (ACAPI::ZoneBoundaryQuery& query, const API_Guid& zoneGuid)
 {
-    const GS::ObjectState* zoneElementId = parameters.Get ("zoneElementId");
-    if (zoneElementId == nullptr) {
-        return CreateErrorResponse (APIERR_BADPARS, "zoneElementId is missing");
-    }
-
-#ifdef ServerMainVers_2800
-    ACAPI::ZoneBoundaryQuery query = ACAPI::CreateZoneBoundaryQuery ();
-
-    ACAPI::Result updateResult = query.Modify (
-        [&] (ACAPI::ZoneBoundaryQuery::Modifier& modifier) -> GSErrCode {
-            ACAPI::Result<void> result = modifier.Update (processControl);
-            return result.IsOk () ? NoError : result.UnwrapErr ().kind;
-        }
-    );
-
-    if (updateResult.IsErr ()) {
-        return CreateErrorResponse (updateResult.UnwrapErr ().kind, "Failed to execute zone boundary query");
-    }
-
-    GS::ObjectState response;
-    const auto& zoneBoundaries = response.AddList<GS::ObjectState> ("zoneBoundaries");
-
-    const API_Guid zoneGuid = GetGuidFromObjectState (*zoneElementId);
     const ACAPI::Result<std::vector<ACAPI::ZoneBoundary>> boundaries = query.GetZoneBoundaries (zoneGuid);
 
     if (boundaries.IsErr ()) {
         return CreateErrorResponse (boundaries.UnwrapErr ().kind, "Failed to get zone boundary");
     }
+
+    GS::ObjectState zoneBoundariesOS;
+    const auto& zoneBoundaries = zoneBoundariesOS.AddList<GS::ObjectState> ("zoneBoundaries");
 
     for (const ACAPI::ZoneBoundary& boundary : boundaries.Unwrap ()) {
         GS::ObjectState boundaryOS;
@@ -3214,7 +3183,7 @@ GS::ObjectState GetZoneBoundariesCommand::Execute (
                     polygonOutline (Create3DCoordinateObjectState (*reinterpret_cast<API_Coord3D*> (&vertex)));
                     break;
                 }
-                
+
                 body.GetEdge (edgeIndex, &edge);
                 body.GetVertex (edge.GetVertexIndex1 (), &vertex);
 
@@ -3228,6 +3197,62 @@ GS::ObjectState GetZoneBoundariesCommand::Execute (
         }
 
         zoneBoundaries (boundaryOS);
+    }
+
+    return zoneBoundariesOS;
+}
+
+#endif
+
+GS::ObjectState GetZoneBoundariesCommand::Execute (
+    const GS::ObjectState& parameters,
+#ifdef ServerMainVers_2800
+    GS::ProcessControl& processControl) const
+#else
+    GS::ProcessControl& /*processControl*/) const
+#endif
+{
+    const GS::ObjectState* zoneElementId = parameters.Get ("zoneElementId");
+    GS::Array<GS::ObjectState> zones;
+    const bool zonesGiven = parameters.Get ("zones", zones);
+
+    if (zoneElementId == nullptr && !zonesGiven) {
+        return CreateErrorResponse (APIERR_BADPARS, "One of zoneElementId and zones is required");
+    }
+
+    if (zoneElementId != nullptr && zonesGiven) {
+        return CreateErrorResponse (APIERR_BADPARS, "Only one of zoneElementId and zones can be given");
+    }
+
+#ifdef ServerMainVers_2800
+    ACAPI::ZoneBoundaryQuery query = ACAPI::CreateZoneBoundaryQuery ();
+
+    ACAPI::Result updateResult = query.Modify (
+        [&] (ACAPI::ZoneBoundaryQuery::Modifier& modifier) -> GSErrCode {
+            ACAPI::Result<void> result = modifier.Update (processControl);
+            return result.IsOk () ? NoError : result.UnwrapErr ().kind;
+        }
+    );
+
+    if (updateResult.IsErr ()) {
+        return CreateErrorResponse (updateResult.UnwrapErr ().kind, "Failed to execute zone boundary query");
+    }
+
+    if (zoneElementId != nullptr) {
+        return GetBoundariesOfZone (query, GetGuidFromObjectState (*zoneElementId));
+    }
+
+    GS::ObjectState response;
+    const auto& zoneBoundariesOfZones = response.AddList<GS::ObjectState> ("zoneBoundariesOfZones");
+
+    for (const GS::ObjectState& zone : zones) {
+        const GS::ObjectState* elementId = zone.Get ("elementId");
+        if (elementId == nullptr) {
+            zoneBoundariesOfZones (CreateErrorResponse (APIERR_BADPARS, "elementId is missing"));
+            continue;
+        }
+
+        zoneBoundariesOfZones (GetBoundariesOfZone (query, GetGuidFromObjectState (*elementId)));
     }
 
     return response;
@@ -3960,15 +3985,6 @@ GS::ObjectState HighlightElementsCommand::Execute (const GS::ObjectState& /*para
 #endif
 
 
-static API_Coord3D TransformPoint (const API_Coord3D& pt, const API_Tranmat& tm)
-{
-    API_Coord3D res;
-    res.x = (pt.x * tm.tmx[0]) + (pt.y * tm.tmx[1]) + (pt.z * tm.tmx[2]) + tm.tmx[3];
-    res.y = (pt.x * tm.tmx[4]) + (pt.y * tm.tmx[5]) + (pt.z * tm.tmx[6]) + tm.tmx[7];
-    res.z = (pt.x * tm.tmx[8]) + (pt.y * tm.tmx[9]) + (pt.z * tm.tmx[10]) + tm.tmx[11];
-    return res;
-}
-
 static void UpdateGlobalBoundsWithPoint (API_Box3D& globalBounds, const API_Coord3D& pt)
 {
     if (pt.x < globalBounds.xMin) globalBounds.xMin = pt.x;
@@ -3979,30 +3995,21 @@ static void UpdateGlobalBoundsWithPoint (API_Box3D& globalBounds, const API_Coor
     if (pt.z > globalBounds.zMax) globalBounds.zMax = pt.z;
 }
 
-static void GetLocalBodyCorners (const API_BodyType& body, API_Coord3D (&corners)[8])
+static void InitializeEmptyBounds (API_Box3D& bounds)
 {
-    corners[0] = { body.xmin, body.ymin, body.zmin };
-    corners[1] = { body.xmax, body.ymin, body.zmin };
-    corners[2] = { body.xmin, body.ymax, body.zmin };
-    corners[3] = { body.xmax, body.ymax, body.zmin };
-    corners[4] = { body.xmin, body.ymin, body.zmax };
-    corners[5] = { body.xmax, body.ymin, body.zmax };
-    corners[6] = { body.xmin, body.ymax, body.zmax };
-    corners[7] = { body.xmax, body.ymax, body.zmax };
+    bounds.xMin = bounds.yMin = bounds.zMin = 1e30;
+    bounds.xMax = bounds.yMax = bounds.zMax = -1e30;
 }
 
-static GSErrCode CalculateSolidBodyBounds (const API_Elem_Head& elemHead, API_Box3D& outBounds)
+// Extends bounds with the solid 3D bodies of the element. foundSolidBody is only ever set to
+// true here, so the same accumulator can be run over several elements in a row.
+static GSErrCode AccumulateSolidBodyBounds (const API_Elem_Head& elemHead, API_Box3D& bounds, bool& foundSolidBody)
 {
-    outBounds.xMin = outBounds.yMin = outBounds.zMin = 1e30;
-    outBounds.xMax = outBounds.yMax = outBounds.zMax = -1e30;
-
     API_ElemInfo3D info3D = {};
     GSErrCode err = ACAPI_ModelAccess_Get3DInfo (elemHead, &info3D);
     if (err != NoError) {
         return err;
     }
-
-    bool foundSolidBody = false;
 
     for (Int32 iBody = info3D.fbody; iBody <= info3D.lbody; ++iBody) {
         API_Component3D bodyComp = {};
@@ -4017,13 +4024,65 @@ static GSErrCode CalculateSolidBodyBounds (const API_Elem_Head& elemHead, API_Bo
 
         foundSolidBody = true;
 
-        API_Coord3D corners[8];
-        GetLocalBodyCorners (bodyComp.body, corners);
+        // body.xmin..zmax is the body's bounding box in world coordinates: measured on a
+        // live model it equals the min/max of the body's vertices *after* they are
+        // transformed by body.tranmat. Applying tranmat to it again adds the placement a
+        // second time, which is what made a stair report twice its height (#563). It went
+        // unnoticed for Roofs and Zones only because their tranmat is the identity.
+        UpdateGlobalBoundsWithPoint (bounds, API_Coord3D { bodyComp.body.xmin, bodyComp.body.ymin, bodyComp.body.zmin });
+        UpdateGlobalBoundsWithPoint (bounds, API_Coord3D { bodyComp.body.xmax, bodyComp.body.ymax, bodyComp.body.zmax });
+    }
 
-        for (int k = 0; k < 8; ++k) {
-            const API_Coord3D globalPt = TransformPoint (corners[k], bodyComp.body.tranmat);
-            UpdateGlobalBoundsWithPoint (outBounds, globalPt);
-        }
+    return NoError;
+}
+
+static GSErrCode CalculateSolidBodyBounds (const API_Elem_Head& elemHead, API_Box3D& outBounds)
+{
+    InitializeEmptyBounds (outBounds);
+
+    bool foundSolidBody = false;
+    GSErrCode err = AccumulateSolidBodyBounds (elemHead, outBounds, foundSolidBody);
+    if (err != NoError) {
+        return err;
+    }
+
+    if (!foundSolidBody) {
+        return APIERR_GENERAL;
+    }
+
+    return NoError;
+}
+
+template<typename APIElemType>
+static void AccumulateSubelementBounds (APIElemType* subelemArray, API_Box3D& bounds, bool& foundSolidBody)
+{
+    if (subelemArray == nullptr) {
+        return;
+    }
+
+    const GSSize nSubelements = BMGetPtrSize (reinterpret_cast<GSPtr>(subelemArray)) / sizeof (APIElemType);
+    for (GSIndex i = 0; i < nSubelements; ++i) {
+        AccumulateSolidBodyBounds (subelemArray[i].head, bounds, foundSolidBody);
+    }
+}
+
+// A Stair carries its 3D geometry in its subelements (risers, treads and structures), so neither
+// ACAPI_Element_CalcBounds nor the 3D model of the Stair element itself gives back the vertical
+// extent of the flight - both answer with zMin == zMax == 0 (#563). The bounds are the union of
+// the solid bodies of the Stair and of all of its subelements.
+static GSErrCode CalculateStairBounds (const API_Elem_Head& stairElemHead, API_Box3D& outBounds)
+{
+    InitializeEmptyBounds (outBounds);
+
+    bool foundSolidBody = false;
+    AccumulateSolidBodyBounds (stairElemHead, outBounds, foundSolidBody);
+
+    API_ElementMemo memo = {};
+    const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
+    if (ACAPI_Element_GetMemo (stairElemHead.guid, &memo, APIMemoMask_All) == NoError) {
+        AccumulateSubelementBounds (memo.stairRisers, outBounds, foundSolidBody);
+        AccumulateSubelementBounds (memo.stairTreads, outBounds, foundSolidBody);
+        AccumulateSubelementBounds (memo.stairStructures, outBounds, foundSolidBody);
     }
 
     if (!foundSolidBody) {
@@ -4102,6 +4161,13 @@ GS::ObjectState Get3DBoundingBoxesCommand::Execute (const GS::ObjectState& param
         API_Box3D box3D = {};
         if (typeID == API_RoofID || typeID == API_ZoneID) {
             err = CalculateSolidBodyBounds (elemHead, box3D);
+        } else if (typeID == API_StairID) {
+            err = CalculateStairBounds (elemHead, box3D);
+            if (err != NoError) {
+                // The Stair has no solid body at all - for example it is filtered out of the 3D
+                // model - so fall back to the old answer instead of failing the whole element.
+                err = ACAPI_Element_CalcBounds (&elemHead, &box3D);
+            }
         } else {
             err = ACAPI_Element_CalcBounds (&elemHead, &box3D);
         }

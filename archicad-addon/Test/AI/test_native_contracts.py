@@ -363,13 +363,13 @@ class NativeContractTests(unittest.TestCase):
 
     def test_annotation_units_and_field_applicability(self):
         element = {'elementId': {'guid': '11111111-1111-4111-8111-111111111111'}}
-        texts = Draft7Validator(schema('AnnotationCommands.cpp', 'ModifyTexts'))
-        labels = Draft7Validator(schema('AnnotationCommands.cpp', 'ModifyLabels'))
-        self.assertTrue(texts.is_valid({'textsWithDetails': [{**element, 'text': 'Chambre\nÉtage', 'widthMillimetres': 80}]}))
-        self.assertFalse(texts.is_valid({'textsWithDetails': [{**element, 'width': 80}]}))
-        self.assertFalse(texts.is_valid({'textsWithDetails': [{**element, 'widthMillimetres': 0}]}))
-        self.assertFalse(texts.is_valid({'textsWithDetails': [element]}))
-        self.assertTrue(labels.is_valid({'labelsWithDetails': [{**element, 'hasLeaderLine': False}]}))
+        texts = Draft7Validator(schema('ElementCreationCommands.cpp', 'ModifyTexts'))
+        labels = Draft7Validator(schema('ElementCreationCommands.cpp', 'ModifyLabels'))
+        self.assertTrue(texts.is_valid({'textsWithDetails': [{**element, 'text': 'Chambre\nÉtage'}]}))
+        self.assertTrue(texts.is_valid({'textsWithDetails': [{**element, 'coordinate': {'x': 0, 'y': 0, 'z': 0}}]}))
+        self.assertFalse(texts.is_valid({'textsWithDetails': [{**element, 'widthMillimetres': 80}]}))
+        self.assertFalse(texts.is_valid({'textsWithDetails': [{'text': 'no element id'}]}))
+        self.assertTrue(labels.is_valid({'labelsWithDetails': [{**element, 'leaderLine': {'hasLeaderLine': False}}]}))
         self.assertFalse(labels.is_valid({'labelsWithDetails': [{**element, 'widthMillimetres': 80}]}))
 
     def test_all_new_literal_schemas_are_valid_json_schema(self):
